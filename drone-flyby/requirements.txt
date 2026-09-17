@@ -8,6 +8,7 @@ pydantic>=2.7,<3          # [2.13.4]
 numpy>=1.26               # [2.5.2]
 opencv-python>=4.9        # [5.0.0.93]
 requests>=2.31            # [2.34.2]
+ultralytics>=8.0,<9       # [8.0.134]
 
 # Only needed by local_evaluator.py. It is the same scorer the competition
 # uses, and the same version range.
