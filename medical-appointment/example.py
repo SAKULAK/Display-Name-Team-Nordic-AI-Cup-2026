@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import torch
 import csv
 import os
 
@@ -316,7 +317,18 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     evidence_start = []
     evidence_end = []
 
-    transcibed_raw = transcibe(audio_bytes)
+    try:
+        transcibed_raw = transcibe(audio_bytes)
+    except Exception as e:
+        logger.exception("CRITICAL: Transcription crashed on %s: %s", request.audio_filename, e)
+        # Clean any remaining CUDA memory after a crash
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return ASRQuestionResponseDto(
+            answers=[False] * len(request.questions),
+            evidence_start=[None] * len(request.questions),
+            evidence_end=[None] * len(request.questions),
+        )
     # transcibed_raw = {"segments": []}
 
     for question in request.questions:
