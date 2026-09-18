@@ -35,24 +35,34 @@ ollama_client = ollama.Client(host=OLLAMA_HOST)
 # ==============================================================================
 # SYSTEM PROMPT
 # ==============================================================================
-SYSTEM_PROMPT = """You are a strict clinical evidence verification assistant. Your task is to verify whether a given question/statement is explicitly supported by direct evidence in the dialogue.
+SYSTEM_PROMPT = """You are a strict clinical evidence verifier. Your task is to verify if a statement is explicitly TRUE and CONFIRMED by the transcript.
 
-EVIDENCE SPAN RULES:
-1. DIALOGUE CONTEXT: If an answer depends on a question-and-answer exchange (e.g., patient asks about treatment, doctor says "no changes"), include BOTH the question segment and the answer segment.
-2. PROCEDURES / ACTIONS: If verifying an action/examination (e.g., listening with a stethoscope), select all segments from the start of the action to the report of the findings.
-3. COMPLETENESS: Always include complete statement/sentence units. Never select isolated fragmentary words.
-4. If no direct evidence exists, has_evidence is false, and start_seg_id/end_seg_id must be null.
+YOU MUST CHECK FOR THESE 3 HARD-NEGATIVE TRAPS:
+1. ANTONYMS & OPPOSITE FINDINGS:
+   - If the transcript says a finding is "NORMAL", "STABLE", "GOOD", or "UNCHANGED", and the question asks if it is "IMPAIRED", "ABNORMAL", "IRREGULAR", or "INCREASED/CHANGED" -> The claim is CONTRADICTED. has_evidence MUST BE false.
+   - Example: "kidney function is normal" vs "showed impaired kidney function?" -> CONTRADICTED.
+   - Example: "No changes to treatment" vs "Should dose be increased?" -> CONTRADICTED.
 
-CRITICAL VERIFICATION RULES:
-- POLARITY & NEGATION: Ensure the transcript AFFIRMS the claim. If the transcript negates the claim (e.g., statement asks "Have complications been identified?" and the transcript says "no complications"), answer has_evidence: false.
-- SPAN COMPLETENESS: Always return the full segment ID(s) containing the complete speaker utterance. Never return partial sub-phrases.
+2. NEGATION & ABSENCE:
+   - Words like "no", "not", "without", "nothing abnormal", "no new symptoms" indicate absence.
+   - Example: "with no complications" vs "Have complications been identified?" -> CONTRADICTED.
 
-OUTPUT FORMAT (strictly JSON):
+3. UNMENTIONED SPECIFIC SYMPTOMS:
+   - If the claim asks about a specific symptom/diagnosis (e.g., "dizziness", "cough", "palpitations") and that exact entity is NEVER named in the transcript, the claim is NOT_MENTIONED.
+   - A general phrase like "no new symptoms" DOES NOT prove that "dizziness" was discussed.
+
+SPAN SELECTION (Only if claim_status is CONFIRMED):
+- Select the tightest segment range [start_seg_id, end_seg_id] directly proving the claim.
+- Include dialogue exchanges (question + answer) if the answer depends on context.
+- For CONTRADICTED or NOT_MENTIONED, start_seg_id and end_seg_id MUST be null.
+
+OUTPUT STRICT VALID JSON:
 {
-  "reasoning": "Brief explanation",
+  "claim_status": "CONFIRMED" | "CONTRADICTED" | "NOT_MENTIONED",
   "has_evidence": true or false,
-  "start_seg_id": <integer segment number, e.g. 5, or null>,
-  "end_seg_id": <integer segment number, e.g. 7, or null>
+  "rationale": "<brief 3-7 words explanation>",
+  "start_seg_id": <int or null>,
+  "end_seg_id": <int or null>
 }
 """
 
@@ -229,7 +239,11 @@ def answer_question(
                 {"role": "user", "content": user_prompt},
             ],
             format="json",
-            options={"temperature": 0.0},
+            options={
+                "temperature": 0.0,
+                # Crucial: limits generation length to keep worst conversation well under 60s
+                "num_predict": 75,
+            },
             keep_alive=-1,
         )
         data = json.loads(response.message.content)
@@ -239,9 +253,14 @@ def answer_question(
             append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
         return False, None
 
-    has_evidence = data.get("has_evidence")
-    if not isinstance(has_evidence, bool):
-        has_evidence = str(has_evidence).strip().lower() == "true"
+    # Strict status enforcement
+    claim_status = str(data.get("claim_status", "")).strip().upper()
+    raw_has_evidence = data.get("has_evidence")
+    if not isinstance(raw_has_evidence, bool):
+        raw_has_evidence = str(raw_has_evidence).strip().lower() == "true"
+
+    # Only accept true if claim_status is strictly CONFIRMED
+    has_evidence = raw_has_evidence and (claim_status == "CONFIRMED")
 
     if not has_evidence:
         if csv_path:
@@ -251,7 +270,6 @@ def answer_question(
     start_id = data.get("start_seg_id")
     end_id = data.get("end_seg_id")
 
-    # Fallback / validation for segment IDs
     if start_id is None or end_id is None:
         if csv_path:
             append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
@@ -266,7 +284,6 @@ def answer_question(
     if start_id > end_id:
         start_id, end_id = end_id, start_id
 
-    # Resolve bounds from WhisperX segments
     if start_id in segment_map and end_id in segment_map:
         start = segment_map[start_id]["start"]
         end = segment_map[end_id]["end"]
