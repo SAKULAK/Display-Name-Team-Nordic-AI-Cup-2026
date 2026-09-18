@@ -35,31 +35,24 @@ ollama_client = ollama.Client(host=OLLAMA_HOST)
 # ==============================================================================
 # SYSTEM PROMPT
 # ==============================================================================
-SYSTEM_PROMPT = """You are a strict evidence verification assistant. Your task is to verify whether a given question/claim is explicitly supported by direct evidence in the provided audio transcript.
+SYSTEM_PROMPT = """You are a strict clinical evidence verification assistant. Your task is to verify whether a given question/statement is explicitly supported by direct evidence in the dialogue.
 
-CRITICAL INSTRUCTIONS:
-1. FOCUS ON EVIDENCE FIRST: Do not guess, speculate, or answer using outside knowledge. Your sole objective is to search the transcript for explicit, factual evidence supporting the statement.
-2. IF DIRECT EVIDENCE IS FOUND:
-   - "has_evidence" must be true.
-   - "quote": Extract the exact verbatim quote from the transcript that proves the claim.
-   - "start": The starting timestamp of the supporting evidence segment.
-   - "end": The ending timestamp of the supporting evidence segment.
-3. IF NO DIRECT EVIDENCE IS FOUND:
-   - "has_evidence" must be false.
-   - "quote": null
-   - "start": null
-   - "end": null
-   - This applies if:
-     a) The transcript contradicts or disputes the statement.
-     b) The statement is not mentioned in the transcript.
-     c) The statement is plausible in reality, but cannot be proven directly from the transcript.
-4. Output strictly valid JSON with this exact schema:
+EVIDENCE SPAN RULES:
+1. DIALOGUE CONTEXT: If an answer depends on a question-and-answer exchange (e.g., patient asks about treatment, doctor says "no changes"), include BOTH the question segment and the answer segment.
+2. PROCEDURES / ACTIONS: If verifying an action/examination (e.g., listening with a stethoscope), select all segments from the start of the action to the report of the findings.
+3. COMPLETENESS: Always include complete statement/sentence units. Never select isolated fragmentary words.
+4. If no direct evidence exists, has_evidence is false, and start_seg_id/end_seg_id must be null.
+
+CRITICAL VERIFICATION RULES:
+- POLARITY & NEGATION: Ensure the transcript AFFIRMS the claim. If the transcript negates the claim (e.g., statement asks "Have complications been identified?" and the transcript says "no complications"), answer has_evidence: false.
+- SPAN COMPLETENESS: Always return the full segment ID(s) containing the complete speaker utterance. Never return partial sub-phrases.
+
+OUTPUT FORMAT (strictly JSON):
 {
-  "reasoning": "Briefly describe the evidence search and whether explicit proof exists",
+  "reasoning": "Brief explanation",
   "has_evidence": true or false,
-  "quote": "verbatim quote or null",
-  "start": <number or timestamp or null>,
-  "end": <number or timestamp or null>
+  "start_seg_id": <integer segment number, e.g. 5, or null>,
+  "end_seg_id": <integer segment number, e.g. 7, or null>
 }
 """
 
@@ -121,6 +114,22 @@ def format_precise_transcript(raw_data: dict) -> str:
         text = seg.get("text", "").strip()
         lines.append(f"[{start:.3f} - {end:.3f}] {speaker}: {text}")
     return "\n".join(lines)
+
+def format_indexed_transcript(raw_data: dict) -> Tuple[str, Dict[int, dict]]:
+    """Format segments with unique IDs for discrete LLM selection."""
+    lines = []
+    segment_map = {}
+
+    for idx, seg in enumerate(raw_data.get("segments", [])):
+        start = seg.get("start", 0.0)
+        end = seg.get("end", 0.0)
+        speaker = seg.get("speaker", "SPEAKER")
+        text = seg.get("text", "").strip()
+
+        segment_map[idx] = {"start": start, "end": end, "text": text}
+        lines.append(f"[SEG_{idx}] {speaker}: {text}")
+
+    return "\n".join(lines), segment_map
 
 
 def parse_timestamp(val: Any) -> Optional[float]:
@@ -198,27 +207,18 @@ def answer_question(
     transcribed_raw: Union[bytes, str, dict],
     audio_filename: str,
     question: str,
-    use_readable_format: Optional[bool] = None,
     csv_path: Optional[str] = CSV_OUTPUT_PATH,
 ) -> Tuple[bool, Optional[Span]]:
-    """Determine whether the question is supported by evidence in the transcript."""
-    if use_readable_format is None:
-        use_readable_format = USE_READABLE_TRANSCRIPT
-
     raw_data = parse_raw_data(transcribed_raw)
     transcript_id = os.path.splitext(os.path.basename(audio_filename))[0]
 
-    # Format transcript according to test option
-    if use_readable_format:
-        transcript_text = generate_readable_transcript(transcribed_raw)
-    else:
-        transcript_text = format_precise_transcript(raw_data)
+    # Format transcript with discrete segment IDs
+    transcript_text, segment_map = format_indexed_transcript(raw_data)
 
     user_prompt = (
         f"Transcript:\n\"\"\"\n{transcript_text}\n\"\"\"\n\n"
-        f"Statement/Question to verify:\n\"{question}\"\n\n"
-        "Search the transcript for explicit evidence supporting this statement. "
-        "Return the response in the specified JSON format."
+        f"Question to verify: \"{question}\"\n\n"
+        "Identify if explicit evidence exists and return the segment range [start_seg_id, end_seg_id]."
     )
 
     try:
@@ -229,20 +229,16 @@ def answer_question(
                 {"role": "user", "content": user_prompt},
             ],
             format="json",
-            options={
-                "temperature": 0.0,
-            },
-            keep_alive=-1,  # Keeps model pinned in GPU VRAM
+            options={"temperature": 0.0},
+            keep_alive=-1,
         )
-        content = response.message.content
-        data = json.loads(content)
+        data = json.loads(response.message.content)
     except Exception:
-        logger.exception("Failed to query Ollama or parse JSON output for: %s", question)
+        logger.exception("Failed to query Ollama for: %s", question)
         if csv_path:
             append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
         return False, None
 
-    # Extract decision
     has_evidence = data.get("has_evidence")
     if not isinstance(has_evidence, bool):
         has_evidence = str(has_evidence).strip().lower() == "true"
@@ -252,27 +248,31 @@ def answer_question(
             append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
         return False, None
 
-    # Parse timestamps
-    start = parse_timestamp(data.get("start"))
-    end = parse_timestamp(data.get("end"))
+    start_id = data.get("start_seg_id")
+    end_id = data.get("end_seg_id")
 
-    # Attempt to snap quote to exact word timestamps
-    quote = data.get("quote")
-    refined_span = refine_span_with_words(quote, raw_data)
-    if refined_span is not None:
-        start, end = refined_span
-
-    # Validate timestamps: if true, valid start and end are strictly required
-    if start is None or end is None:
-        logger.warning("Evidence claimed as True, but timestamps missing. Setting False.")
+    # Fallback / validation for segment IDs
+    if start_id is None or end_id is None:
         if csv_path:
             append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
         return False, None
 
-    if start > end:
-        start, end = end, start
+    try:
+        start_id = int(start_id)
+        end_id = int(end_id)
+    except (ValueError, TypeError):
+        return False, None
 
-    # Save positive match to CSV
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id
+
+    # Resolve bounds from WhisperX segments
+    if start_id in segment_map and end_id in segment_map:
+        start = segment_map[start_id]["start"]
+        end = segment_map[end_id]["end"]
+    else:
+        return False, None
+
     if csv_path:
         append_answer_to_csv(csv_path, transcript_id, question, True, start, end)
 
