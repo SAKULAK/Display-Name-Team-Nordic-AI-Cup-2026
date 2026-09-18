@@ -45,7 +45,7 @@ def transcibe(audio_bytes):
         HF_TOKEN = f.read().strip()
 
     # 1. Transcribe with Whisper Large-v3-turbo
-    model = whisperx.load_model("large-v3-turbo", device, compute_type=compute_type)
+    model = whisperx.load_model("large-v3-turbo", device, compute_type=compute_type, language="en")
     audio = load_audio_from_bytes(audio_bytes)
     result = model.transcribe(audio, batch_size=batch_size)
 
