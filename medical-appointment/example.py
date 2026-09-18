@@ -1,19 +1,18 @@
-"""ASR Question Answering pipeline using Ollama and Llama-3.3-70b."""
+"""ASR Question Answering pipeline using Ollama and word-level temporal snapping."""
 
+import csv
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import torch
-import csv
-import os
-
 import ollama
+import torch
 
 from dtos import ASRQuestionRequestDto, ASRQuestionResponseDto
+from transcribe_audio import transcribe, warmup_transcription
 from utils import Span, audio_duration_seconds, decode_audio
-from transcribe_audio import transcibe, generate_readable_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -21,215 +20,253 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ==============================================================================
 OLLAMA_HOST = "http://127.0.0.1:13018"
-OLLAMA_MODEL = "qwen2.5:14b"
-# Set to a filename to save answers, or None to disable CSV export
+OLLAMA_MODEL = "phi4"
 CSV_OUTPUT_PATH = "answers.csv"
 
-# TOGGLE FOR EXPERIMENTATION:
-# False -> Uses segment timestamps with full float precision (recommended)
-# True  -> Uses generate_readable_transcript() [MM:SS format]
-USE_READABLE_TRANSCRIPT = False
-
-# Initialize the Ollama client
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
 # ==============================================================================
 # SYSTEM PROMPT
 # ==============================================================================
-SYSTEM_PROMPT = """You are a strict clinical evidence verifier. Your task is to verify if a statement is explicitly TRUE and CONFIRMED by the transcript.
+SYSTEM_PROMPT = """You are a strict clinical evidence verifier. Your task is to verify if a claim is factually TRUE and explicitly CONFIRMED by the transcript.
 
-YOU MUST CHECK FOR THESE 3 HARD-NEGATIVE TRAPS:
-1. ANTONYMS & OPPOSITE FINDINGS:
-   - If the transcript says a finding is "NORMAL", "STABLE", "GOOD", or "UNCHANGED", and the question asks if it is "IMPAIRED", "ABNORMAL", "IRREGULAR", or "INCREASED/CHANGED" -> The claim is CONTRADICTED. has_evidence MUST BE false.
-   - Example: "kidney function is normal" vs "showed impaired kidney function?" -> CONTRADICTED.
-   - Example: "No changes to treatment" vs "Should dose be increased?" -> CONTRADICTED.
+CRITICAL RULES FOR VERIFICATION:
+1. DOCTOR-PATIENT NEGATION (MUST be CONTRADICTED / has_evidence: false):
+   - If a doctor asks about a symptom or event ("Any fever?", "Does the pain radiate down your leg?", "Any known COVID exposure?"), and the patient answers "No", "None", or "Nothing like that" -> The claim that the patient had this symptom is CONTRADICTED.
+   - If an exam finding is absent ("no pus", "no sores", "no redness", "no swelling", "no foreign body") -> Claims asserting the finding was present or seen are CONTRADICTED.
+   - If a test was negative ("strep test was negative", "COVID test was negative") -> Claims asserting infection/bacteria found are CONTRADICTED.
 
-2. NEGATION & ABSENCE:
-   - Words like "no", "not", "without", "nothing abnormal", "no new symptoms" indicate absence.
-   - Example: "with no complications" vs "Have complications been identified?" -> CONTRADICTED.
+2. ANTONYMS & OPPOSITE FINDINGS (MUST be CONTRADICTED / has_evidence: false):
+   - "Normal", "stable", "good", or "unchanged" CONTRADICTS claims of "abnormal", "impaired", "elevated", "unstable", or "worsened".
 
-3. UNMENTIONED SPECIFIC SYMPTOMS:
-   - If the claim asks about a specific symptom/diagnosis (e.g., "dizziness", "cough", "palpitations") and that exact entity is NEVER named in the transcript, the claim is NOT_MENTIONED.
-   - A general phrase like "no new symptoms" DOES NOT prove that "dizziness" was discussed.
+3. UNMENTIONED SPECIFIC ENTITIES (MUST be NOT_MENTIONED / has_evidence: false):
+   - If a specific symptom, diagnosis, or entity was never named, it is NOT_MENTIONED.
+   - Strict matching: "holiday" is not "weekend"; watching a television series is not a "specific hobby".
 
-SPAN SELECTION (Only if claim_status is CONFIRMED):
-- Select the tightest segment range [start_seg_id, end_seg_id] directly proving the claim.
-- Include dialogue exchanges (question + answer) if the answer depends on context.
-- For CONTRADICTED or NOT_MENTIONED, start_seg_id and end_seg_id MUST be null.
+4. EVIDENCE LOCALIZATION (Only if claim_status is CONFIRMED):
+   - Identify the single sentence [S_id] containing the direct proof.
+   - Extract the exact short quote (3 to 6 words) from that sentence directly stating the fact.
 
 OUTPUT STRICT VALID JSON:
 {
+  "rationale": "<brief 3-7 words explaining if affirmed, denied with no, normal vs abnormal, or unmentioned>",
   "claim_status": "CONFIRMED" | "CONTRADICTED" | "NOT_MENTIONED",
   "has_evidence": true or false,
-  "rationale": "<brief 3-7 words explanation>",
-  "start_seg_id": <int or null>,
-  "end_seg_id": <int or null>
+  "seg_id": <int or null>,
+  "quote": "<exact short quote from transcript or null>"
 }
 """
 
+# ==============================================================================
+# WARMUP FUNCTION
+# ==============================================================================
+def warmup_pipeline():
+    """Warms up WhisperX and Ollama at startup so Conversation 1 never times out."""
+    warmup_transcription()
+    logger.info("Warming up Ollama (%s)...", OLLAMA_MODEL)
+    try:
+        ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            options={"num_predict": 1},
+            keep_alive=-1,
+        )
+        logger.info("Ollama warmup complete.")
+    except Exception as e:
+        logger.warning("Ollama warmup encountered an issue: %s", e)
+
+
+# Run warmup immediately on import
+warmup_pipeline()
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 def parse_raw_data(transcribed_raw: Union[bytes, str, dict]) -> dict:
-    """Ensure transcribed_raw is parsed into a Python dictionary."""
     if isinstance(transcribed_raw, dict):
         return transcribed_raw
     if isinstance(transcribed_raw, bytes):
         return json.loads(transcribed_raw.decode("utf-8"))
     if isinstance(transcribed_raw, str):
         return json.loads(transcribed_raw)
-    raise ValueError(f"Unsupported transcribed_raw format: {type(transcribed_raw)}")
+    raise ValueError(f"Unsupported format: {type(transcribed_raw)}")
 
-def append_answer_to_csv(
-    csv_path: str,
-    transcript_id: str,
-    question: str,
-    has_evidence: bool,
-    start: Optional[float],
-    end: Optional[float],
-) -> None:
-    """Append a single question-answer result to a CSV file."""
-    fieldnames = [
-        "transcript_id",
-        "question",
-        "answer",
-        "label",
-        "evidence_start",
-        "evidence_end",
-    ]
-    file_exists = os.path.isfile(csv_path)
-
-    with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-
-        writer.writerow({
-            "transcript_id": transcript_id,
-            "question": question,
-            "answer": "yes" if has_evidence else "no",
-            "label": 1 if has_evidence else 0,
-            "evidence_start": f"{start:.3f}" if (has_evidence and start is not None) else "",
-            "evidence_end": f"{end:.3f}" if (has_evidence and end is not None) else "",
-        })
-
-
-def format_precise_transcript(raw_data: dict) -> str:
-    """Format segments with full float seconds precision."""
-    lines = []
-    for seg in raw_data.get("segments", []):
-        start = seg.get("start", 0.0)
-        end = seg.get("end", 0.0)
-        speaker = seg.get("speaker", "SPEAKER")
-        text = seg.get("text", "").strip()
-        lines.append(f"[{start:.3f} - {end:.3f}] {speaker}: {text}")
-    return "\n".join(lines)
 
 def format_indexed_transcript(raw_data: dict) -> Tuple[str, Dict[int, dict]]:
-    """Format segments with unique IDs for discrete LLM selection."""
-    lines = []
-    segment_map = {}
+  """Splits Whisper segments into distinct sentences using word timestamps.
 
-    for idx, seg in enumerate(raw_data.get("segments", [])):
-        start = seg.get("start", 0.0)
-        end = seg.get("end", 0.0)
-        speaker = seg.get("speaker", "SPEAKER")
-        text = seg.get("text", "").strip()
+  Returns:
+      transcript_text: Formatted string of [S_0], [S_1], ... for the prompt.
+      sentence_map: Dict mapping int -> {"start": float, "end": float, "text":
+      str, "words": list}
+  """
+  lines = []
+  sentence_map = {}
+  sent_id = 0
 
-        segment_map[idx] = {"start": start, "end": end, "text": text}
-        lines.append(f"[SEG_{idx}] {speaker}: {text}")
+  for seg in raw_data.get("segments", []):
+    words = seg.get("words", [])
 
-    return "\n".join(lines), segment_map
+    # Fallback: if WhisperX alignment didn't produce words for this segment,
+    # keep the raw segment as a single unit so nothing is lost.
+    if not words:
+      text = seg.get("text", "").strip()
+      if text:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        sentence_map[sent_id] = {
+            "start": start,
+            "end": end,
+            "text": text,
+            "words": [],
+        }
+        lines.append(f"[S_{sent_id}] {text}")
+        sent_id += 1
+      continue
 
+    curr_words = []
+    for w in words:
+      if "start" not in w or "end" not in w:
+        continue
+      curr_words.append(w)
 
-def parse_timestamp(val: Any) -> Optional[float]:
-    """Parse float, int, MM:SS, or HH:MM:SS timestamps to seconds as a float."""
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        val = val.strip().lower().rstrip("s")
-        if not val or val in ("null", "none"):
-            return None
-        if ":" in val:
-            parts = val.split(":")
-            try:
-                if len(parts) == 2:
-                    return float(parts[0]) * 60 + float(parts[1])
-                elif len(parts) == 3:
-                    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-            except ValueError:
-                return None
-        try:
-            return float(val)
-        except ValueError:
-            return None
+      # Break into a sentence on terminal punctuation (. ? !) or after 18 words
+      clean_token = w.get("word", "").strip()
+      is_terminal = (
+          bool(clean_token)
+          and clean_token[-1] in ".?!"
+          or len(curr_words) >= 18
+      )
+
+      if is_terminal and curr_words:
+        sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
+        sentence_map[sent_id] = {
+            "start": float(curr_words[0]["start"]),
+            "end": float(curr_words[-1]["end"]),
+            "text": sent_text,
+            "words": curr_words,
+        }
+        lines.append(f"[S_{sent_id}] {sent_text}")
+        sent_id += 1
+        curr_words = []
+
+    # Catch any leftover words in the segment
+    if curr_words:
+      sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
+      sentence_map[sent_id] = {
+          "start": float(curr_words[0]["start"]),
+          "end": float(curr_words[-1]["end"]),
+          "text": sent_text,
+          "words": curr_words,
+      }
+      lines.append(f"[S_{sent_id}] {sent_text}")
+      sent_id += 1
+
+  return "\n".join(lines), sentence_map
+
+def refine_span_with_words(
+    quote: Optional[str],
+    target_seg: dict,
+    raw_data: dict,
+) -> Optional[Tuple[float, float]]:
+  """Snaps an LLM quote to exact word-level timestamps from WhisperX alignment.
+
+  Returns (start, end) in seconds, or None if no reliable match is found.
+  """
+  if not quote or not quote.strip():
     return None
 
+  # Clean quote tokens: lowercase, strip all non-alphanumeric characters
+  clean_quote = [re.sub(r"[^\w]", "", w).lower() for w in quote.split()]
+  clean_quote = [w for w in clean_quote if w]
+  if not clean_quote:
+    return None
 
-def refine_span_with_words(quote: Optional[str], raw_data: dict) -> Optional[Tuple[float, float]]:
-    """Snap a quote to the exact word timestamps in transcribed_raw if available."""
-    if not quote or not quote.strip():
-        return None
+  def search_word_list(words_list: List[dict]) -> Optional[Tuple[float, float]]:
+    """Searches a list of WhisperX word dicts for the best quote match."""
+    # Extract only words that have valid start and end timestamps
+    cleaned_words = []
+    for w in words_list:
+      cw = re.sub(r"[^\w]", "", w.get("word", "")).lower()
+      if cw and "start" in w and "end" in w:
+        cleaned_words.append((cw, float(w["start"]), float(w["end"])))
 
-    clean_quote_words = re.findall(r"\w+", quote.lower())
-    if not clean_quote_words:
-        return None
+    if not cleaned_words:
+      return None
 
-    # Flatten all word objects from segments
-    all_words: List[Dict[str, Any]] = []
-    for seg in raw_data.get("segments", []):
-        for w in seg.get("words", []):
-            word_str = re.sub(r"[^\w]", "", w.get("word", "")).lower()
-            if word_str:
-                all_words.append({
-                    "word": word_str,
-                    "start": w.get("start"),
-                    "end": w.get("end"),
-                })
+    q_len = len(clean_quote)
 
-    if not all_words:
-        return None
+    # Strategy A: Sliding window over words
+    if len(cleaned_words) >= q_len:
+      best_score = 0.0
+      best_span = None
 
-    # Sliding window search over word sequence
-    q_len = len(clean_quote_words)
-    best_match = None
-    best_score = 0.0
+      for i in range(len(cleaned_words) - q_len + 1):
+        window = [cleaned_words[i + k][0] for k in range(q_len)]
+        score = sum(1 for a, b in zip(clean_quote, window) if a == b) / q_len
+        if score > best_score and score >= 0.60:
+          best_score = score
+          best_span = (cleaned_words[i][1], cleaned_words[i + q_len - 1][2])
+          if score == 1.0:
+            return best_span
 
-    for i in range(len(all_words) - q_len + 1):
-        window = [w["word"] for w in all_words[i : i + q_len]]
-        score = sum(1 for a, b in zip(clean_quote_words, window) if a == b) / q_len
-        if score > 0.8 and score > best_score:
-            best_score = score
-            start_val = all_words[i].get("start")
-            end_val = all_words[i + q_len - 1].get("end")
-            if start_val is not None and end_val is not None:
-                best_match = (float(start_val), float(end_val))
+      if best_span is not None and best_score >= 0.70:
+        return best_span
 
-    return best_match
+    # Strategy B: Anchor on first and last word of the quote
+    first_tok = clean_quote[0]
+    last_tok = clean_quote[-1]
+
+    cand_starts = [s for (tok, s, e) in cleaned_words if tok == first_tok]
+    cand_ends = [e for (tok, s, e) in cleaned_words if tok == last_tok]
+
+    # Find the tightest valid span (must be > 0s and < 30s)
+    valid_spans = [
+        (s, e)
+        for s in cand_starts
+        for e in cand_ends
+        if 0.3 <= (e - s) <= 30.0 and s < e
+    ]
+    if valid_spans:
+      # Return the shortest valid span that fits
+      valid_spans.sort(key=lambda span: span[1] - span[0])
+      return valid_spans[0]
+
+    return None
+
+  # 1. Search inside the target segment first (avoids duplicate matches elsewhere)
+  target_words = target_seg.get("words", [])
+  if target_words:
+    span = search_word_list(target_words)
+    if span and span[0] < span[1]:
+      return span
+
+  # 2. Fallback: Search all words in the entire transcript
+  all_words = []
+  for seg in raw_data.get("segments", []):
+    all_words.extend(seg.get("words", []))
+
+  if all_words:
+    span = search_word_list(all_words)
+    if span and span[0] < span[1]:
+      return span
+
+  return None
 
 
 # ==============================================================================
 # MAIN ANSWER FUNCTION
 # ==============================================================================
 def answer_question(
-    transcribed_raw: Union[bytes, str, dict],
-    audio_filename: str,
+    raw_data: dict,
     question: str,
-    csv_path: Optional[str] = CSV_OUTPUT_PATH,
 ) -> Tuple[bool, Optional[Span]]:
-    raw_data = parse_raw_data(transcribed_raw)
-    transcript_id = os.path.splitext(os.path.basename(audio_filename))[0]
-
-    # Format transcript with discrete segment IDs
     transcript_text, segment_map = format_indexed_transcript(raw_data)
 
     user_prompt = (
         f"Transcript:\n\"\"\"\n{transcript_text}\n\"\"\"\n\n"
-        f"Question to verify: \"{question}\"\n\n"
-        "Identify if explicit evidence exists and return the segment range [start_seg_id, end_seg_id]."
+        f"Claim to verify: \"{question}\"\n\n"
+        "State if explicitly confirmed, contradicted, or not mentioned. Return JSON."
     )
 
     try:
@@ -242,86 +279,68 @@ def answer_question(
             format="json",
             options={
                 "temperature": 0.0,
-                # Crucial: limits generation length to keep worst conversation well under 60s
-                "num_predict": 75,
+                "num_predict": 80,
+                "num_ctx": 4096,
             },
             keep_alive=-1,
         )
         data = json.loads(response.message.content)
     except Exception:
-        logger.exception("Failed to query Ollama for: %s", question)
-        if csv_path:
-            append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
+        logger.exception("Ollama query failed for question: %s", question)
         return False, None
 
-    # Strict status enforcement
     claim_status = str(data.get("claim_status", "")).strip().upper()
     raw_has_evidence = data.get("has_evidence")
     if not isinstance(raw_has_evidence, bool):
         raw_has_evidence = str(raw_has_evidence).strip().lower() == "true"
 
-    # Only accept true if claim_status is strictly CONFIRMED
-    has_evidence = raw_has_evidence and (claim_status == "CONFIRMED")
-
-    if not has_evidence:
-        if csv_path:
-            append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
+    # Strict confirmation check
+    if not (raw_has_evidence and claim_status == "CONFIRMED"):
         return False, None
 
-    start_id = data.get("start_seg_id")
-    end_id = data.get("end_seg_id")
-
-    if start_id is None or end_id is None:
-        if csv_path:
-            append_answer_to_csv(csv_path, transcript_id, question, False, None, None)
-        return False, None
+    # Handle segment ID
+    sent_id = data.get("sentence_id")
+    if sent_id is None:
+      sent_id = data.get("seg_id") or data.get("start_seg_id")
 
     try:
-        start_id = int(start_id)
-        end_id = int(end_id)
+      sent_id = int(sent_id)
     except (ValueError, TypeError):
-        return False, None
+      return False, None
 
-    if start_id > end_id:
-        start_id, end_id = end_id, start_id
+    if sent_id not in segment_map:  # segment_map is your sentence_map
+      return False, None
 
-    if start_id in segment_map and end_id in segment_map:
-        start = segment_map[start_id]["start"]
-        end = segment_map[end_id]["end"]
+    target_sent = segment_map[sent_id]
+    coarse_start = target_sent["start"]
+    coarse_end = target_sent["end"]
+
+    # Refine within the target sentence using word timestamps
+    quote = data.get("quote")
+    refined_span = refine_span_with_words(quote, target_sent, raw_data)
+
+    if refined_span and refined_span[0] < refined_span[1]:
+      start, end = refined_span
     else:
-        return False, None
+      # If quote matching fails, falling back to a 3-second sentence unit
+      # already yields ~0.70-0.85 tIoU!
+      start, end = coarse_start, coarse_end
 
-    if csv_path:
-        append_answer_to_csv(csv_path, transcript_id, question, True, start, end)
-
-    return True, (start, end)
+    return True, (round(start, 3), round(end, 3))
 
 
 # ==============================================================================
 # PIPELINE ENTRY POINT
 # ==============================================================================
 def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
-    """Answer every question about one conversation."""
     audio_bytes = decode_audio(request.audio_base64)
-
     duration = audio_duration_seconds(audio_bytes)
-    logger.info(
-        "%s (%.1f s, %.1f MB): %d questions",
-        request.audio_filename,
-        duration if duration is not None else float("nan"),
-        len(audio_bytes) / 1e6,
-        len(request.questions),
-    )
-
-    answers = []
-    evidence_start = []
-    evidence_end = []
+    logger.info("Processing %s (%.1f s, %d questions)", request.audio_filename, duration or 0.0, len(request.questions))
 
     try:
-        transcibed_raw = transcibe(audio_bytes)
+        raw_result = transcribe(audio_bytes)
     except Exception as e:
-        logger.exception("CRITICAL: Transcription crashed on %s: %s", request.audio_filename, e)
-        # Clean any remaining CUDA memory after a crash
+        logger.exception("Transcription failed on %s: %s", request.audio_filename, e)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return ASRQuestionResponseDto(
@@ -329,18 +348,19 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
             evidence_start=[None] * len(request.questions),
             evidence_end=[None] * len(request.questions),
         )
-    # transcibed_raw = {"segments": []}
+
+    answers = []
+    evidence_start = []
+    evidence_end = []
 
     for question in request.questions:
         try:
-            answer, span = answer_question(
-                transcibed_raw, request.audio_filename, question
-            )
+            ans, span = answer_question(raw_result, question)
         except Exception:
-            logger.exception("Falling back to False for: %s", question)
-            answer, span = False, None
+            logger.exception("Error answering question: %s", question)
+            ans, span = False, None
 
-        answers.append(answer)
+        answers.append(ans)
         evidence_start.append(span[0] if span is not None else None)
         evidence_end.append(span[1] if span is not None else None)
 
