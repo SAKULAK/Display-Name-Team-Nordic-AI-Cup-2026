@@ -1,5 +1,21 @@
 """ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
 
+v4 - LLM sentence ranges and question/answer pairing are OFF by default.
+  The v3 rerun showed they are unstable: 20 of 189 range decisions flipped
+  between v2 and v3, and the effect of ranges on mean tIoU changed sign
+  (about 0.000 with v2's picks, -0.017 with v3's). The prompt is back to v1's
+  single-sentence evidence rule. Turn them back on with QA_ENABLE_RANGE=1 and
+  QA_ENABLE_PAIRING=1. The ASR hints (which recovered Esomeprazole and Airomir
+  in v3) stay.
+
+v3 - two narrow changes on top of v2, both based on the v2 rerun:
+  * Evidence-selection wording reverted to v1's ("the sentence containing the
+    direct proof"). In v2 the "most direct and complete statement" wording moved
+    14 picks to another sentence: 5 got much worse, 3 much better, net -0.010 tIoU.
+  * ASR spelling hints: when a claim word differs from a transcript word only in
+    vowels (Esomeprazole vs Isomeprazole, Airomir vs Aromir) the model is told so.
+    2 of the 5 remaining false negatives were exactly this.
+
 v2 - evidence spans tuned toward the ground-truth annotation style.
 
 What changed vs. v1 (see the analysis of 185 true positives):
@@ -20,6 +36,7 @@ What changed vs. v1 (see the analysis of 185 true positives):
 """
 
 import csv
+import difflib
 import json
 import logging
 import os
@@ -39,8 +56,8 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ==============================================================================
 OLLAMA_HOST = "http://127.0.0.1:16614"
-OLLAMA_MODEL = "phi4"
-CSV_OUTPUT_PATH = "answers_v2.csv"   # new name: the column set changed
+OLLAMA_MODEL = os.environ.get("QA_MODEL", "phi4")
+CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v4.csv")   # new name: the column set changed
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
@@ -55,8 +72,13 @@ SPAN_END_PAD_SEC = -0.1
 MAX_SPAN_SENTENCES = 3
 MAX_SPAN_SEC = 10.0
 
+# Multi-sentence evidence returned by the LLM (start_seg_id..end_seg_id).
+# OFF: ranges were break-even at best and unstable between prompt versions.
+ENABLE_LLM_RANGE = os.environ.get("QA_ENABLE_RANGE", "0") == "1"
+
 # Question/answer pairing for bare replies ("None.", "Observation.", "Yes.").
-ENABLE_QA_PAIRING = True
+# OFF: 5 cases per run, net effect -0.005 (v2) and -0.0003 (v3) on mean tIoU.
+ENABLE_QA_PAIRING = os.environ.get("QA_ENABLE_PAIRING", "0") == "1"
 QA_SHORT_ANSWER_WORDS = 4     # target counts as a bare answer if <= this
 QA_SHORT_REPLY_WORDS = 6      # reply that follows a question sentence
 QA_MAX_GAP_SEC = 1.5          # max silence between the paired sentences
@@ -70,6 +92,16 @@ USE_QUOTE_SNAPPING = False
 # Re-run the hard-negative questions after enabling; v1 had 0 false positives.
 ALLOW_SYNONYM_MATCH = True
 
+# Tell the model about ASR spelling errors between the claim and the transcript.
+# A pair only counts when the words differ ONLY in vowels (identical consonant
+# skeleton), e.g. Esomeprazole/Isomeprazole, Airomir/Aromir. A plain similarity
+# score cannot be used: prednisone/prednisolone scores 0.91, the same as
+# Esomeprazole/Isomeprazole, but is a different drug (hard negatives may use
+# such pairs). Check the 142 hard negatives after enabling.
+ENABLE_ASR_VARIANT_HINTS = True
+ASR_VARIANT_MIN_LEN = 7        # claim word length; shorter words are too often real words (affect/effect)
+ASR_VARIANT_MIN_RATIO = 0.8    # sanity check on top of the skeleton match
+
 APPROX_CHARS_PER_TOKEN = 3.5
 NUM_CTX = 4096
 
@@ -80,7 +112,7 @@ _SYNONYM_RULE = """
    - Same entity under a different name still counts as mentioned: lay terms vs medical terms ("long-term sugar value" = HbA1c), and ASR spelling variants of a drug or diagnosis ("Isomeprazole" ~ "Esomeprazole", "molluscum" ~ "molluscs"). Numbers, units, negation and side of the body must still match exactly.
 """
 
-SYSTEM_PROMPT = """You are a strict clinical evidence verifier. Your task is to verify if a claim is factually TRUE and explicitly CONFIRMED by the transcript.
+_PROMPT_HEAD = """You are a strict clinical evidence verifier. Your task is to verify if a claim is factually TRUE and explicitly CONFIRMED by the transcript.
 
 CRITICAL RULES FOR VERIFICATION:
 1. DOCTOR-PATIENT NEGATION (MUST be CONTRADICTED / has_evidence: false):
@@ -95,9 +127,26 @@ CRITICAL RULES FOR VERIFICATION:
 3. UNMENTIONED SPECIFIC ENTITIES (MUST be NOT_MENTIONED / has_evidence: false):
    - If a specific symptom, diagnosis, or entity was never named, it is NOT_MENTIONED.
    - Strict matching: "holiday" is not "weekend"; watching a television series is not a "specific hobby".
-{synonym_rule}
+"""
+
+_EVIDENCE_SINGLE = """
 4. EVIDENCE LOCALIZATION (Only if claim_status is CONFIRMED):
-   - Choose the sentence [S_id] that states the fact most directly and completely. If the same fact is stated several times, prefer the explicit statement (the clinician's finding, assessment or plan, or the patient's direct answer to the doctor's question) over a passing mention.
+   - Identify the single sentence [S_id] containing the direct proof.
+   - Extract the exact short quote (3 to 6 words) from that sentence directly stating the fact.
+
+OUTPUT STRICT VALID JSON:
+{
+  "rationale": "<brief 3-7 words explaining if affirmed, denied with no, normal vs abnormal, or unmentioned>",
+  "claim_status": "CONFIRMED" | "CONTRADICTED" | "NOT_MENTIONED",
+  "has_evidence": true or false,
+  "seg_id": <int or null>,
+  "quote": "<exact short quote from transcript or null>"
+}
+"""
+
+_EVIDENCE_RANGE = """
+4. EVIDENCE LOCALIZATION (Only if claim_status is CONFIRMED):
+   - Identify the single sentence [S_id] that contains the direct proof.
    - Report start_seg_id and end_seg_id. Normally they are the SAME sentence id.
    - If the chosen sentence is only a bare short answer ("None.", "Yes.", "No changes.", "Observation."), set start_seg_id to the question or statement right before it that gives the answer its meaning.
    - If the chosen sentence is a question and the next short sentence is the reply that confirms it, set end_seg_id to that reply.
@@ -105,15 +154,26 @@ CRITICAL RULES FOR VERIFICATION:
    - "quote" = the complete clause that states the fact, copied exactly from the transcript (not a 2-3 word fragment).
 
 OUTPUT STRICT VALID JSON:
-{{
+{
   "rationale": "<brief 3-7 words explaining if affirmed, denied with no, normal vs abnormal, or unmentioned>",
   "claim_status": "CONFIRMED" | "CONTRADICTED" | "NOT_MENTIONED",
   "has_evidence": true or false,
   "start_seg_id": <int or null>,
   "end_seg_id": <int or null>,
   "quote": "<exact clause from transcript or null>"
-}}
-""".format(synonym_rule=_SYNONYM_RULE if ALLOW_SYNONYM_MATCH else "")
+}
+"""
+
+
+def build_system_prompt(enable_range: bool = False, synonym_rule: bool = True) -> str:
+    return (
+        _PROMPT_HEAD
+        + (_SYNONYM_RULE if synonym_rule else "")
+        + (_EVIDENCE_RANGE if enable_range else _EVIDENCE_SINGLE)
+    )
+
+
+SYSTEM_PROMPT = build_system_prompt(ENABLE_LLM_RANGE, ALLOW_SYNONYM_MATCH)
 
 # ==============================================================================
 # WARMUP FUNCTION
@@ -156,6 +216,10 @@ ANALYSIS_FIELDNAMES = [
     "llm_end_seg_id",
     "final_seg_range",       # ids actually used after pairing / clamping
     "llm_quote",
+    "asr_hints",
+    "q_overlap_max",         # router feature: best question/sentence content-word overlap (0-1)
+    "q_overlap_n",           # router feature: number of sentences with overlap >= 0.5
+    "n_sentences",
     "target_sentence_text",
     "coarse_sent_start",
     "coarse_sent_end",
@@ -310,6 +374,57 @@ def locate_sentence(
     return None
 
 
+def _all_words(segment_map: Dict[int, dict]) -> set:
+    words = set()
+    for sent in segment_map.values():
+        words.update(_tokens(sent["text"]))
+    return words
+
+
+def question_overlap_features(question: str, segment_map: Dict[int, dict]) -> Tuple[float, int]:
+    """Cheap routing features, logged for every question.
+    q_overlap_max: how strongly the transcript talks about the claim's topic
+                   (~0 for off-topic questions, high for hard negatives).
+    q_overlap_n:   how many sentences mention it (>=2 means several candidate
+                   evidence sentences, where the ground truth may pick another one)."""
+    toks = _content_tokens(question)
+    if not toks:
+        return 0.0, 0
+    scores = [len(toks & _content_tokens(s["text"])) / len(toks) for s in segment_map.values()]
+    return round(max(scores, default=0.0), 3), sum(1 for x in scores if x >= 0.5)
+
+
+def _skeleton(word: str) -> str:
+    """Consonant skeleton: drop vowels, collapse doubled letters."""
+    return re.sub(r"(.)\1+", r"\1", re.sub(r"[aeiou]", "", word))
+
+
+def asr_variant_hints(question: str, segment_map: Dict[int, dict]) -> List[Tuple[str, str]]:
+    """Claim words missing from the transcript that appear there with only the
+    vowels changed (typical ASR errors on drug and diagnosis names).
+    Pure inflections (medication / medications) are ignored."""
+    if not ENABLE_ASR_VARIANT_HINTS:
+        return []
+    all_words = _all_words(segment_map)
+    hints = []
+    for q in dict.fromkeys(_tokens(question)):
+        if len(q) < ASR_VARIANT_MIN_LEN or q in _STOPWORDS or q in all_words:
+            continue
+        q_skel = _skeleton(q)
+        if len(q_skel) < 3:
+            continue
+        best, best_ratio = None, 0.0
+        for t in all_words:
+            if len(t) < 5 or t.startswith(q) or q.startswith(t) or _skeleton(t) != q_skel:
+                continue
+            ratio = difflib.SequenceMatcher(None, q, t).ratio()
+            if ratio >= ASR_VARIANT_MIN_RATIO and ratio > best_ratio:
+                best, best_ratio = t, ratio
+        if best is not None:
+            hints.append((q, best))
+    return hints
+
+
 # ==============================================================================
 # EVIDENCE SPAN CONSTRUCTION
 # ==============================================================================
@@ -437,6 +552,11 @@ def resolve_evidence_range(
         pick = locate_sentence(segment_map, quote, question, [start_id, end_id]) or start_id
         return pick, pick, "SENTENCE"
 
+    if hi > lo and not ENABLE_LLM_RANGE:
+        # The model may still return a range; keep only the sentence that best matches the quote.
+        pick = locate_sentence(segment_map, quote, question, list(range(lo, hi + 1))) or lo
+        return pick, pick, "SENTENCE"
+
     too_many = (hi - lo + 1) > MAX_SPAN_SENTENCES
     s, e = _range_times(lo, hi, segment_map)
     too_long = (hi > lo) and (e - s) > MAX_SPAN_SEC
@@ -517,15 +637,27 @@ def answer_question(
     """Answers question and returns (answer, span, qualitative_meta_dict)."""
     transcript_text, segment_map = format_indexed_transcript(raw_data)
 
+    hints = asr_variant_hints(question, segment_map)
+    hint_text = ""
+    if hints:
+        hint_text = (
+            "Note: likely ASR spelling errors in the transcript (treat each pair as the same word): "
+            + "; ".join(f'claim "{q}" = transcript "{t}"' for q, t in hints)
+            + ".\n\n"
+        )
+
     user_prompt = (
         f"Transcript:\n\"\"\"\n{transcript_text}\n\"\"\"\n\n"
         f"Claim to verify: \"{question}\"\n\n"
+        f"{hint_text}"
         "State if explicitly confirmed, contradicted, or not mentioned. Return JSON."
     )
 
     approx_tokens = (len(SYSTEM_PROMPT) + len(user_prompt)) / APPROX_CHARS_PER_TOKEN
     if approx_tokens > NUM_CTX * 0.9:
         logger.warning("Prompt ~%d tokens is close to num_ctx=%d; the transcript may be truncated.", approx_tokens, NUM_CTX)
+
+    q_max, q_n = question_overlap_features(question, segment_map)
 
     info: Dict[str, Any] = {
         "question": question,
@@ -541,6 +673,10 @@ def answer_question(
         "llm_end_seg_id": None,
         "final_seg_range": None,
         "llm_quote": None,
+        "asr_hints": "; ".join(f"{q}={t}" for q, t in hints),
+        "q_overlap_max": q_max,
+        "q_overlap_n": q_n,
+        "n_sentences": len(segment_map),
         "target_sentence_text": None,
         "coarse_sent_start": None,
         "coarse_sent_end": None,
