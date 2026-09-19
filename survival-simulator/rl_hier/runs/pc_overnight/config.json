@@ -1,0 +1,51 @@
+{
+  "base_seed": 17,
+  "workers": 6,
+  "hidden_sizes": [
+    256,
+    256
+  ],
+  "gamma": 0.9995,
+  "gae_lambda": 0.95,
+  "clip": 0.2,
+  "learning_rate": 0.0003,
+  "epochs": 6,
+  "minibatch_size": 1024,
+  "rollout_steps": 128,
+  "value_coefficient": 0.5,
+  "entropy_coefficient": 0.01,
+  "max_grad_norm": 0.5,
+  "target_kl": 0.03,
+  "dt": 0.1,
+  "action_repeat": 5,
+  "extinction_penalty": 5.0,
+  "horizon_bonus": 5.0,
+  "energy_shaping": 0.0,
+  "horizons": [
+    300.0,
+    900.0,
+    1800.0,
+    3000.0
+  ],
+  "curriculum_window": 20,
+  "curriculum_success_rate": 0.7,
+  "curriculum_max_decisions": 200000,
+  "curriculum_max_seconds": 5400.0,
+  "validation_seeds": [
+    2147483648,
+    2147483649,
+    2147483650,
+    2147483651,
+    2147483652
+  ],
+  "validation_policy_mode": "stochastic",
+  "validation_policy_rollouts": 3,
+  "validation_policy_seed_base": 20260918,
+  "checkpoint_seconds": 900,
+  "validation_seconds": 3600,
+  "max_hours": 8,
+  "shutdown_margin_seconds": 30.0,
+  "worker_timeout_seconds": 180.0,
+  "device": "auto",
+  "output_dir": "rl_hier/runs/pc_overnight"
+}

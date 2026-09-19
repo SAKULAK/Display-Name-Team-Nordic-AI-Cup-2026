@@ -1,0 +1,14 @@
+{
+  "workers": 6,
+  "device": "auto",
+  "hidden_sizes": [256, 256],
+  "rollout_steps": 128,
+  "minibatch_size": 1024,
+  "checkpoint_seconds": 900,
+  "validation_seconds": 3600,
+  "validation_policy_mode": "stochastic",
+  "validation_policy_rollouts": 3,
+  "validation_policy_seed_base": 20260918,
+  "max_hours": 8,
+  "output_dir": "rl_hier/runs/pc_overnight"
+}
