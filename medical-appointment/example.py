@@ -1,5 +1,15 @@
 """ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
 
+v5 - optional "second look" at the evidence sentence (OFF by default) plus richer logging.
+  Behaviour with the defaults is identical to v4. Every confirmed question now logs a
+  candidate table (chosen sentence, its neighbours, the best lexical matches, with
+  timings) so any span policy can be replayed offline against the ground truth.
+    QA_SECOND_LOOK=lexical   no extra LLM call: switch to the sentence that matches the
+                             claim's words clearly better than the chosen one
+    QA_SECOND_LOOK=llm       one short follow-up call (same chat, so the transcript prefix
+                             can be served from the KV cache) choosing between a few sentences
+  Only questions that trip a trigger get a second look (about 10% of all questions).
+
 v4 - LLM sentence ranges and question/answer pairing are OFF by default.
   The v3 rerun showed they are unstable: 20 of 189 range decisions flipped
   between v2 and v3, and the effect of ranges on mean tIoU changed sign
@@ -41,6 +51,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ollama
@@ -57,7 +68,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 OLLAMA_HOST = "http://127.0.0.1:16614"
 OLLAMA_MODEL = os.environ.get("QA_MODEL", "phi4")
-CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v4.csv")   # new name: the column set changed
+CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v5.csv")   # new name: the column set changed
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
@@ -101,6 +112,18 @@ ALLOW_SYNONYM_MATCH = True
 ENABLE_ASR_VARIANT_HINTS = True
 ASR_VARIANT_MIN_LEN = 7        # claim word length; shorter words are too often real words (affect/effect)
 ASR_VARIANT_MIN_RATIO = 0.8    # sanity check on top of the skeleton match
+
+# ---- Second look at the evidence sentence -------------------------------------
+# Triggers (checked on the v4 run, 191 confirmed questions; "bad" = IoU < 0.3, base rate 25%):
+#   lex_gap : another sentence shares >= 0.25 more of the claim's content words than the
+#             chosen one (29 questions, 59% bad, mean IoU 0.30 vs 0.64)
+#   short   : chosen sentence has <= 3 words (18 questions, 72% bad, mean IoU 0.29 vs 0.62)
+# Together: 38 questions = 9.7% of all questions, about 1 per conversation.
+SECOND_LOOK_MODE = os.environ.get("QA_SECOND_LOOK", "llm").strip().lower()   # 0 | lexical | llm
+S2_MIN_LEX_GAP = 0.25
+S2_SHORT_WORDS = 3
+S2_MAX_OFFERED = 2           # sentences offered to the LLM besides the chosen one
+S2_MAX_ELAPSED_SEC = 40.0    # skip the second look once the conversation has used this much time
 
 APPROX_CHARS_PER_TOKEN = 3.5
 NUM_CTX = 4096
@@ -217,6 +240,18 @@ ANALYSIS_FIELDNAMES = [
     "final_seg_range",       # ids actually used after pairing / clamping
     "llm_quote",
     "asr_hints",
+    "llm_ms",                # stage-1 LLM time
+    "chosen_overlap",        # claim-word overlap of the chosen sentence
+    "lex_best_id",
+    "lex_best_overlap",
+    "lex_gap",               # best other sentence minus chosen sentence
+    "s2_mode",
+    "s2_reason",             # lex_gap | short | lex_gap+short | ""
+    "s2_offered",
+    "s2_choice",
+    "s2_changed",
+    "s2_ms",
+    "cand_json",             # chosen / prev / next / top lexical sentences with timings
     "q_overlap_max",         # router feature: best question/sentence content-word overlap (0-1)
     "q_overlap_n",           # router feature: number of sentences with overlap >= 0.5
     "n_sentences",
@@ -423,6 +458,98 @@ def asr_variant_hints(question: str, segment_map: Dict[int, dict]) -> List[Tuple
         if best is not None:
             hints.append((q, best))
     return hints
+
+
+# ==============================================================================
+# SECOND LOOK
+# ==============================================================================
+def lexical_scores(question: str, segment_map: Dict[int, dict]) -> Dict[int, float]:
+    """Share of the claim's content words found in each sentence."""
+    toks = _content_tokens(question)
+    if not toks:
+        return {}
+    return {sid: len(toks & _content_tokens(sent["text"])) / len(toks) for sid, sent in segment_map.items()}
+
+
+def ranked_alternatives(chosen_id: int, scores: Dict[int, float], k: int) -> List[int]:
+    """Other sentences by claim-word overlap (ties: closest to the chosen one)."""
+    others = [sid for sid in scores if sid != chosen_id and scores[sid] > 0]
+    others.sort(key=lambda sid: (-scores[sid], abs(sid - chosen_id), sid))
+    return others[:k]
+
+
+def second_look_reason(chosen_id: int, scores: Dict[int, float], segment_map: Dict[int, dict]) -> str:
+    reasons = []
+    best_other = max((v for sid, v in scores.items() if sid != chosen_id), default=0.0)
+    if best_other - scores.get(chosen_id, 0.0) >= S2_MIN_LEX_GAP:
+        reasons.append("lex_gap")
+    if _word_count(segment_map[chosen_id]["text"]) <= S2_SHORT_WORDS:
+        reasons.append("short")
+    return "+".join(reasons)
+
+
+def candidate_table(chosen_id: int, scores: Dict[int, float], segment_map: Dict[int, dict], k: int = 3) -> str:
+    """JSON list with the chosen sentence, its neighbours and the top lexical matches,
+    so any span policy can be evaluated offline without re-running the LLM."""
+    roles: Dict[int, List[str]] = {chosen_id: ["chosen"]}
+    for sid, role in ((chosen_id - 1, "prev"), (chosen_id + 1, "next")):
+        if sid in segment_map:
+            roles.setdefault(sid, []).append(role)
+    for sid in ranked_alternatives(chosen_id, scores, k):
+        roles.setdefault(sid, []).append("lex")
+    rows = []
+    for sid in sorted(roles):
+        sent = segment_map[sid]
+        rows.append({
+            "id": sid,
+            "role": "+".join(roles[sid]),
+            "start": round(sent["start"], 3),
+            "end": round(sent["end"], 3),
+            "ov": round(scores.get(sid, 0.0), 3),
+            "text": sent["text"][:160],
+        })
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _second_look_llm(
+    user_prompt: str,
+    first_reply: str,
+    chosen_id: int,
+    offered: List[int],
+    segment_map: Dict[int, dict],
+) -> Optional[int]:
+    """Follow-up turn in the SAME chat. The messages up to the follow-up are exactly
+    what stage 1 sent plus its reply, so the transcript prefix can be reused from the
+    KV cache; only the short tail is new and the answer is a few tokens."""
+    def show(i: int) -> str:
+        return f'[S_{i}] "{segment_map[i]["text"][:200]}"'
+
+    tail = (
+        "Second check of the evidence sentence for the same claim. "
+        f"Current choice: {show(chosen_id)}. "
+        "Other sentences that share words with the claim: " + "; ".join(show(i) for i in offered) + ". "
+        "Which ONE of these sentences states the claim most directly? "
+        'Reply with JSON only: {"seg_id": <int>}'
+    )
+    try:
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": first_reply},
+                {"role": "user", "content": tail},
+            ],
+            format="json",
+            options={"temperature": 0.0, "num_predict": 24, "num_ctx": NUM_CTX},
+            keep_alive=-1,
+        )
+        data = json.loads(response.message.content)
+        pick = _first_int(data.get("seg_id")) if isinstance(data, dict) else None
+    except Exception:
+        logger.exception("Second-look LLM call failed; keeping the first choice")
+        return None
+    return pick if pick in ([chosen_id] + offered) else None
 
 
 # ==============================================================================
@@ -633,6 +760,7 @@ def _query_llm(user_prompt: str, info: Dict[str, Any]) -> Optional[dict]:
 def answer_question(
     raw_data: dict,
     question: str,
+    t_start: Optional[float] = None,
 ) -> Tuple[bool, Optional[Span], Dict[str, Any]]:
     """Answers question and returns (answer, span, qualitative_meta_dict)."""
     transcript_text, segment_map = format_indexed_transcript(raw_data)
@@ -674,6 +802,18 @@ def answer_question(
         "final_seg_range": None,
         "llm_quote": None,
         "asr_hints": "; ".join(f"{q}={t}" for q, t in hints),
+        "llm_ms": None,
+        "chosen_overlap": None,
+        "lex_best_id": None,
+        "lex_best_overlap": None,
+        "lex_gap": None,
+        "s2_mode": SECOND_LOOK_MODE,
+        "s2_reason": "",
+        "s2_offered": "",
+        "s2_choice": None,
+        "s2_changed": False,
+        "s2_ms": None,
+        "cand_json": "",
         "q_overlap_max": q_max,
         "q_overlap_n": q_n,
         "n_sentences": len(segment_map),
@@ -683,7 +823,9 @@ def answer_question(
         "raw_llm_json": "",
     }
 
+    t_llm = time.monotonic()
     data = _query_llm(user_prompt, info)
+    info["llm_ms"] = int(1000 * (time.monotonic() - t_llm))
     if data is None:
         return False, None, info
 
@@ -715,6 +857,39 @@ def answer_question(
         info["alignment_mode"] = "NONE"
         return True, None, info
 
+    # ---- second look at the evidence sentence (off unless QA_SECOND_LOOK is set) ----
+    if lo == hi:
+        scores = lexical_scores(question, segment_map)
+        stage1_id = lo
+        others = ranked_alternatives(stage1_id, scores, 1)
+        info["chosen_overlap"] = round(scores.get(stage1_id, 0.0), 3)
+        if others:
+            info["lex_best_id"] = others[0]
+            info["lex_best_overlap"] = round(scores[others[0]], 3)
+            info["lex_gap"] = round(scores[others[0]] - scores.get(stage1_id, 0.0), 3)
+        info["cand_json"] = candidate_table(stage1_id, scores, segment_map)
+
+        time_ok = t_start is None or (time.monotonic() - t_start) < S2_MAX_ELAPSED_SEC
+        reason = second_look_reason(stage1_id, scores, segment_map)
+        info["s2_reason"] = reason
+        if SECOND_LOOK_MODE in ("lexical", "llm") and reason and time_ok:
+            new_id = stage1_id
+            if SECOND_LOOK_MODE == "lexical":
+                if "lex_gap" in reason and others:
+                    new_id = others[0]
+            else:
+                offered = ranked_alternatives(stage1_id, scores, S2_MAX_OFFERED)
+                info["s2_offered"] = ",".join(str(i) for i in offered)
+                if offered:
+                    t_s2 = time.monotonic()
+                    pick = _second_look_llm(user_prompt, info["raw_llm_json"], stage1_id, offered, segment_map)
+                    info["s2_ms"] = int(1000 * (time.monotonic() - t_s2))
+                    if pick is not None:
+                        new_id = pick
+            info["s2_choice"] = new_id
+            info["s2_changed"] = new_id != stage1_id
+            lo = hi = new_id
+
     start, end, mode, (lo, hi) = build_evidence_span(lo, hi, mode, quote, segment_map, raw_data)
     info["target_sentence_text"] = " ".join(segment_map[i]["text"] for i in range(lo, hi + 1) if i in segment_map)
     info["coarse_sent_start"] = round(segment_map[lo]["start"], 3)
@@ -735,6 +910,7 @@ def answer_question(
 # PIPELINE ENTRY POINT
 # ==============================================================================
 def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
+    t0 = time.monotonic()
     audio_bytes = decode_audio(request.audio_base64)
     duration = audio_duration_seconds(audio_bytes)
     logger.info("Processing %s (%.1f s, %d questions)", request.audio_filename, duration or 0.0, len(request.questions))
@@ -758,7 +934,7 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
 
     for question in request.questions:
         try:
-            ans, span, info = answer_question(raw_result, question)
+            ans, span, info = answer_question(raw_result, question, t0)
         except Exception:
             logger.exception("Error answering question: %s", question)
             ans, span = False, None
