@@ -1,5 +1,15 @@
 """ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
 
+v5.1 - based on the v5 experiments on the 39 labeled conversations (stage 1 was identical
+  to v4 in every run, so all differences come from the ~10% of questions that were re-checked):
+    QA_SECOND_LOOK=llm      +0.0136 score (95% CI +0.005..+0.025); 8 changes, 7 better, 0 worse;
+                            0.36 s per call, 0.32 s per conversation  -> NOW THE DEFAULT
+    QA_SECOND_LOOK=lexical  -0.0045 score (28 switches: 9 better, 15 worse)  -> do not use
+    QA_PREPEND_SHORT=1      NEW, opt-in: a chosen sentence of <= 3 words gets the sentence before
+                            it prepended. In-sample +0.019 tIoU on top of the LLM second look, but
+                            it is threshold-sensitive (<=4 words +0.011, <=5 words -0.012) and 5 of
+                            the 18 cases got worse: A/B it on unlabeled data before adopting it.
+
 v5 - optional "second look" at the evidence sentence (OFF by default) plus richer logging.
   Behaviour with the defaults is identical to v4. Every confirmed question now logs a
   candidate table (chosen sentence, its neighbours, the best lexical matches, with
@@ -119,11 +129,16 @@ ASR_VARIANT_MIN_RATIO = 0.8    # sanity check on top of the skeleton match
 #             chosen one (29 questions, 59% bad, mean IoU 0.30 vs 0.64)
 #   short   : chosen sentence has <= 3 words (18 questions, 72% bad, mean IoU 0.29 vs 0.62)
 # Together: 38 questions = 9.7% of all questions, about 1 per conversation.
-SECOND_LOOK_MODE = os.environ.get("QA_SECOND_LOOK", "llm").strip().lower()   # 0 | lexical | llm
+SECOND_LOOK_MODE = os.environ.get("QA_SECOND_LOOK", "llm").strip().lower()   # llm | 0 | lexical (not recommended)
 S2_MIN_LEX_GAP = 0.25
 S2_SHORT_WORDS = 3
 S2_MAX_OFFERED = 2           # sentences offered to the LLM besides the chosen one
 S2_MAX_ELAPSED_SEC = 40.0    # skip the second look once the conversation has used this much time
+
+# Opt-in: prepend the previous sentence when the final evidence sentence is a very short reply.
+PREPEND_SHORT = os.environ.get("QA_PREPEND_SHORT", "1") == "1"
+PREPEND_SHORT_WORDS = 3
+PREPEND_MAX_GAP_SEC = 1.5
 
 APPROX_CHARS_PER_TOKEN = 3.5
 NUM_CTX = 4096
@@ -251,6 +266,7 @@ ANALYSIS_FIELDNAMES = [
     "s2_choice",
     "s2_changed",
     "s2_ms",
+    "prepended",
     "cand_json",             # chosen / prev / next / top lexical sentences with timings
     "q_overlap_max",         # router feature: best question/sentence content-word overlap (0-1)
     "q_overlap_n",           # router feature: number of sentences with overlap >= 0.5
@@ -813,6 +829,7 @@ def answer_question(
         "s2_choice": None,
         "s2_changed": False,
         "s2_ms": None,
+        "prepended": False,
         "cand_json": "",
         "q_overlap_max": q_max,
         "q_overlap_n": q_n,
@@ -889,6 +906,17 @@ def answer_question(
             info["s2_choice"] = new_id
             info["s2_changed"] = new_id != stage1_id
             lo = hi = new_id
+
+        if PREPEND_SHORT and lo == hi and not info["s2_changed"]:
+            cur, prev = segment_map[lo], segment_map.get(lo - 1)
+            if (
+                prev is not None
+                and _word_count(cur["text"]) <= PREPEND_SHORT_WORDS
+                and 0.0 <= cur["start"] - prev["end"] <= PREPEND_MAX_GAP_SEC
+            ):
+                lo = lo - 1
+                mode = "SENTENCE_PREPEND"
+                info["prepended"] = True
 
     start, end, mode, (lo, hi) = build_evidence_span(lo, hi, mode, quote, segment_map, raw_data)
     info["target_sentence_text"] = " ".join(segment_map[i]["text"] for i in range(lo, hi + 1) if i in segment_map)
