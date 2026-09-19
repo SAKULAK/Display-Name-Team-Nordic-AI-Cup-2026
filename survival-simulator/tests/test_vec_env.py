@@ -57,6 +57,25 @@ class SubprocVecSurvivalEnvTests(unittest.TestCase):
         finally:
             vec_env.close()
 
+    def test_reset_many_resets_every_requested_env(self):
+        vec_env = SubprocVecSurvivalEnv(3)
+        try:
+            vec_env.reset()
+            reset_obs = vec_env.reset_many([0, 2])
+            self.assertEqual(set(reset_obs.keys()), {0, 2})
+            for obs in reset_obs.values():
+                self.assertGreater(len(obs), 0)
+        finally:
+            vec_env.close()
+
+    def test_reset_many_with_empty_list_returns_empty_dict(self):
+        vec_env = SubprocVecSurvivalEnv(2)
+        try:
+            vec_env.reset()
+            self.assertEqual(vec_env.reset_many([]), {})
+        finally:
+            vec_env.close()
+
 
 if __name__ == "__main__":
     unittest.main()

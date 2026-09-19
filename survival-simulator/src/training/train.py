@@ -143,11 +143,19 @@ def collect_rollout(
 
         step_results = vec_env.step(actions_per_env)
 
+        # Collected here instead of reset inline per env below, then dispatched in
+        # one reset_many() call after the loop - resetting is ~1000x a step()'s cost
+        # (full world regeneration), so doing it one env at a time in this loop
+        # serialized what should be concurrent worker-process work and could easily
+        # cost tens of seconds per rollout whenever many envs died on nearby ticks
+        # (e.g. early in training, before the policy learns to survive long).
+        envs_to_reset: List[int] = []
+
         for env_idx in range(n_envs):
             agent_ids = per_env_agent_ids[env_idx]
             n = len(agent_ids)
             if n == 0:  # defensive: shouldn't normally happen, see reset-on-"__all__" below
-                obs_list[env_idx], _ = vec_env.reset_one(env_idx)
+                envs_to_reset.append(env_idx)
                 continue
 
             local = local_slices[env_idx]
@@ -175,7 +183,12 @@ def collect_rollout(
                 episode_summaries.append(infos["__all__"])
                 segments.append((env_traj, env_term, next_obs))
                 trajectories[env_idx], finished_terminated[env_idx] = {}, {}
-                obs_list[env_idx], _ = vec_env.reset_one(env_idx)
+                envs_to_reset.append(env_idx)
+
+        if envs_to_reset:
+            reset_obs = vec_env.reset_many(envs_to_reset)
+            for env_idx in envs_to_reset:
+                obs_list[env_idx] = reset_obs[env_idx]
 
     for env_idx in range(n_envs):
         segments.append((trajectories[env_idx], finished_terminated[env_idx], obs_list[env_idx]))

@@ -66,6 +66,16 @@ class SubprocVecSurvivalEnv:
         self._remotes[idx].send(("reset", None))
         return self._remotes[idx].recv()
 
+    def reset_many(self, indices: List[int]) -> Dict[int, Dict[int, np.ndarray]]:
+        """Reset several envs, dispatching every reset command before waiting on any
+        reply - like step(), so the actual work (full world regeneration: biome map,
+        fruit/tree spawns - roughly 1000x a single step()'s cost, measured) overlaps
+        across worker processes instead of paying each one back-to-back in the main
+        process. Returns {idx: obs} (drops the {} info half, like reset())."""
+        for idx in indices:
+            self._remotes[idx].send(("reset", None))
+        return {idx: self._remotes[idx].recv()[0] for idx in indices}
+
     def step(self, actions_per_env: List[Dict[int, Tuple[np.ndarray, float]]]):
         """
         Dispatch every env's actions for this tick, then wait for all replies - the
