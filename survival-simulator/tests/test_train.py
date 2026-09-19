@@ -7,8 +7,10 @@ import numpy as np
 import torch
 
 import src.training.train as train_module
+from src.training.gym_env import OBS_DIM
 from src.training.model import ActorCritic
-from src.training.train import GAMMA, GAE_LAMBDA, Trajectory, compute_gae, load_checkpoint, save_checkpoint
+from src.training.train import GAMMA, GAE_LAMBDA, Trajectory, collect_rollout, compute_gae, load_checkpoint, save_checkpoint
+from src.training.vec_env import SubprocVecSurvivalEnv
 
 
 class CheckpointRoundTripTests(unittest.TestCase):
@@ -78,6 +80,32 @@ class GAETests(unittest.TestCase):
         expected_delta = 5.0 + GAMMA * 3.0 - 2.0
         np.testing.assert_allclose(advantages, [expected_delta], atol=1e-6)
         np.testing.assert_allclose(returns, [expected_delta + 2.0], atol=1e-6)
+
+
+class CollectRolloutTests(unittest.TestCase):
+    """collect_rollout defers a died env's reset to a single batched call at the end
+    of the rollout (see its own comment) instead of resetting inline as soon as an
+    env dies - verify that still leaves every env correctly reset and populated by
+    the time the rollout returns, not stuck idle from a mid-rollout death."""
+
+    def test_no_env_left_empty_after_a_rollout_with_mid_rollout_deaths(self):
+        n_envs = 3
+        vec_env = SubprocVecSurvivalEnv(n_envs)
+        try:
+            model = ActorCritic(obs_dim=OBS_DIM)
+            obs_list = vec_env.reset()
+            # Untrained/near-random policy: population wipeout within a few hundred
+            # ticks is the norm (verified separately), so 300 ticks reliably
+            # produces at least one mid-rollout death for a 3-env batch.
+            segments, episode_summaries, latest_info_per_env, obs_list = collect_rollout(
+                vec_env, model, obs_list, num_ticks=300
+            )
+            self.assertEqual(len(obs_list), n_envs)
+            for obs in obs_list:
+                self.assertGreater(len(obs), 0)  # every env has live agents again, none left stalled
+            self.assertGreater(len(episode_summaries), 0)  # sanity: this test scenario actually exercised a death
+        finally:
+            vec_env.close()
 
 
 if __name__ == "__main__":

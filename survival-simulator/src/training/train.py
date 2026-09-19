@@ -115,12 +115,24 @@ def collect_rollout(
     episode_summaries: List[dict] = []  # one "__all__" info snapshot per episode that ended this rollout
     latest_info_per_env: List[dict] = [{} for _ in range(n_envs)]  # each env's most recent "__all__" info
 
+    # Accumulated across the *whole* rollout and reset in one batched call at the
+    # very end, not per-tick - see the call site below for why: even batching every
+    # env that died on the *same* tick isn't enough when deaths are spread across
+    # many different ticks (the common case with short episodes), since each tick
+    # with any death at all still pays a full ~1.4s reset() stall before the next
+    # tick can start. A dead env just sits idle (contributing nothing) for the rest
+    # of this rollout instead - it resumes fresh on the very next rollout, so the
+    # "lost" ticks are deferred, not wasted overall, and avoiding the stall is worth
+    # far more in wall-clock time than what a few idle ticks cost in transitions.
+    pending_reset: set = set()
+
     for _ in range(num_ticks):
         per_env_agent_ids = [list(obs.keys()) for obs in obs_list]
         obs_rows = [obs_list[e][aid] for e in range(n_envs) for aid in per_env_agent_ids[e]]
 
         if not obs_rows:  # every env's population happens to be empty this tick (shouldn't normally occur)
             obs_list = vec_env.reset()
+            pending_reset.clear()
             continue
 
         obs_batch = torch.as_tensor(np.stack(obs_rows), dtype=torch.float32, device=DEVICE)
@@ -148,19 +160,11 @@ def collect_rollout(
 
         step_results = vec_env.step(actions_per_env)
 
-        # Collected here instead of reset inline per env below, then dispatched in
-        # one reset_many() call after the loop - resetting is ~1000x a step()'s cost
-        # (full world regeneration), so doing it one env at a time in this loop
-        # serialized what should be concurrent worker-process work and could easily
-        # cost tens of seconds per rollout whenever many envs died on nearby ticks
-        # (e.g. early in training, before the policy learns to survive long).
-        envs_to_reset: List[int] = []
-
         for env_idx in range(n_envs):
             agent_ids = per_env_agent_ids[env_idx]
             n = len(agent_ids)
-            if n == 0:  # defensive: shouldn't normally happen, see reset-on-"__all__" below
-                envs_to_reset.append(env_idx)
+            if n == 0:  # died earlier this rollout (pending_reset) or the rare all-dead defensive case
+                pending_reset.add(env_idx)
                 continue
 
             local = local_slices[env_idx]
@@ -188,12 +192,13 @@ def collect_rollout(
                 episode_summaries.append(infos["__all__"])
                 segments.append((env_traj, env_term, next_obs))
                 trajectories[env_idx], finished_terminated[env_idx] = {}, {}
-                envs_to_reset.append(env_idx)
+                obs_list[env_idx] = {}  # idle for the rest of this rollout - see pending_reset above
+                pending_reset.add(env_idx)
 
-        if envs_to_reset:
-            reset_obs = vec_env.reset_many(envs_to_reset)
-            for env_idx in envs_to_reset:
-                obs_list[env_idx] = reset_obs[env_idx]
+    if pending_reset:
+        reset_obs = vec_env.reset_many(list(pending_reset))
+        for env_idx in pending_reset:
+            obs_list[env_idx] = reset_obs[env_idx]
 
     for env_idx in range(n_envs):
         segments.append((trajectories[env_idx], finished_terminated[env_idx], obs_list[env_idx]))
