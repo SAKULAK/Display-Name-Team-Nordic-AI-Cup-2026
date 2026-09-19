@@ -1,5 +1,21 @@
 """ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
 
+v5.3 - optional verdict rescue by a second model (OFF unless QA_RESCUE_MODEL is set).
+    QA_RESCUE_MODEL=qwen3:14b
+  Whenever the main model does not return CONFIRMED (about 5 of 10 questions), the same prompt
+  is sent to the rescue model; only a CONFIRMED verdict from it changes the answer, and its
+  sentence becomes the evidence. Replay on the 39 labeled conversations (phi4 main, qwen3:14b
+  rescue): qwen3 said yes on 3 of the 199 phi4 "no" answers, all 3 correct, no false positives
+  (accuracy 0.9897 -> 0.9974, score 0.7681 -> 0.7769). Costs ~5 short calls per conversation.
+  Rescued questions skip the second look (it needs the main model's chat).
+
+v5.2 - works with reasoning models such as qwen3:14b, and rows are tagged with run_id.
+    QA_MODEL=qwen3:14b QA_THINK=0     reasoning off (recommended; keeps the JSON short and fast)
+    QA_MODEL=qwen3:14b QA_THINK=1     reasoning on (slow, see the note at NUM_PREDICT)
+  Whatever the model returns is passed through extract_json(): <think> blocks, code fences and
+  text around the object are tolerated. answers CSVs are opened in append mode, so every row now
+  carries run_id / llm_model / think_mode; QA_CSV_RESET=1 truncates the file at start-up.
+
 v5.1 - based on the v5 experiments on the 39 labeled conversations (stage 1 was identical
   to v4 in every run, so all differences come from the ~10% of questions that were re-checked):
     QA_SECOND_LOOK=llm      +0.0136 score (95% CI +0.005..+0.025); 8 changes, 7 better, 0 worse;
@@ -78,7 +94,11 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 OLLAMA_HOST = "http://127.0.0.1:16614"
 OLLAMA_MODEL = os.environ.get("QA_MODEL", "phi4")
-CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v5.csv")   # new name: the column set changed
+CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v5.3.csv")   # new name: the column set changed
+if os.environ.get("QA_CSV_RESET", "0") == "1" and os.path.isfile(CSV_OUTPUT_PATH):
+    os.remove(CSV_OUTPUT_PATH)
+elif os.path.isfile(CSV_OUTPUT_PATH):
+    logger.warning("%s already exists: new rows are APPENDED (filter on the run_id column, or set QA_CSV_RESET=1).", CSV_OUTPUT_PATH)
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
@@ -142,6 +162,23 @@ PREPEND_MAX_GAP_SEC = 1.5
 
 APPROX_CHARS_PER_TOKEN = 3.5
 NUM_CTX = 4096
+
+# ---- Model / reasoning support (e.g. qwen3:14b) --------------------------------------
+# QA_THINK unset -> the parameter is not sent (right for phi4)
+#           0     -> reasoning off. Recommended for qwen3: short JSON, latency like a normal model.
+#           1     -> reasoning on. Expect hundreds of extra tokens per call (10 questions per
+#                    conversation inside a 60 s budget will probably NOT fit); format=json is
+#                    dropped because it conflicts with reasoning on many Ollama versions.
+_think_env = os.environ.get("QA_THINK", "").strip().lower()
+THINK: Optional[bool] = None if _think_env == "" else _think_env not in ("0", "false", "off", "no")
+TEMPERATURE = float(os.environ.get("QA_TEMPERATURE", "0.6" if THINK else "0.0"))
+NUM_PREDICT = int(os.environ.get("QA_NUM_PREDICT", "1536" if THINK else "160"))
+RUN_ID = os.environ.get("QA_RUN_ID", time.strftime("%Y%m%d-%H%M%S"))
+
+# ---- Verdict rescue by a second model ---------------------------------------------------
+RESCUE_MODEL = os.environ.get("QA_RESCUE_MODEL", "qwen3:14b").strip()          # e.g. "qwen3:14b"; empty = off
+RESCUE_THINK = os.environ.get("QA_RESCUE_THINK", "0").strip().lower() not in ("0", "false", "off", "no", "")
+RESCUE_MAX_ELAPSED_SEC = 45.0    # skip the rescue once the conversation has used this much time
 
 # ==============================================================================
 # SYSTEM PROMPT
@@ -214,6 +251,105 @@ def build_system_prompt(enable_range: bool = False, synonym_rule: bool = True) -
 SYSTEM_PROMPT = build_system_prompt(ENABLE_LLM_RANGE, ALLOW_SYNONYM_MATCH)
 
 # ==============================================================================
+# LLM CALL HELPERS (reasoning-model tolerant)
+# ==============================================================================
+_THINK_UNSUPPORTED: set = set()      # models whose server/client rejected the think parameter
+_UNSET = object()
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def _chat(messages: List[dict], options: dict, use_format: bool = True, think: Optional[bool] = None,
+          model: Optional[str] = None):
+    """Single place that talks to Ollama. `think` is only sent when it is not None, and
+    if the client library or server rejects it the call is repeated without it."""
+    model = model or OLLAMA_MODEL
+    kwargs: Dict[str, Any] = {"model": model, "messages": messages, "options": options, "keep_alive": -1}
+    if use_format:
+        kwargs["format"] = "json"
+    if think is not None and model not in _THINK_UNSUPPORTED:
+        kwargs["think"] = think
+    try:
+        return ollama_client.chat(**kwargs)
+    except Exception as e:
+        if "think" in kwargs and "think" in str(e).lower():
+            logger.warning("The 'think' parameter was rejected (%s); continuing without it "
+                           "(qwen3 still gets the /no_think soft switch).", e)
+            _THINK_UNSUPPORTED.add(model)
+            kwargs.pop("think")
+            return ollama_client.chat(**kwargs)
+        raise
+
+
+def _soft_switch(text: str, model: Optional[str] = None, think: Any = _UNSET) -> str:
+    """Qwen3 honours '/no_think' in the user turn; sent in addition to think=False."""
+    model = OLLAMA_MODEL if model is None else model
+    think = THINK if think is _UNSET else think
+    if think is False and "qwen3" in model.lower():
+        return text + "\n/no_think"
+    return text
+
+
+def _balanced_objects(text: str) -> List[str]:
+    objs, depth, start, in_str, esc = [], 0, None, False, False
+    for i, ch in enumerate(text):
+        if depth > 0 and in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"' and depth > 0:
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objs.append(text[start:i + 1])
+                start = None
+    return objs
+
+
+def extract_json(text: Any) -> Optional[dict]:
+    """Pull the answer object out of a model reply. Tolerates <think>...</think> blocks,
+    ```json fences, text before/after the object and trailing commas. A reply that is
+    only an unfinished <think> block returns None. If several objects are present the
+    last one that looks like an answer wins."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    t = _THINK_BLOCK.sub("", text)
+    low = t.lower()
+    if "<think>" in low:                       # reasoning that never closed (hit num_predict)
+        t = t[: low.index("<think>")]
+    t = t.replace("```json", "").replace("```", "")
+    parsed = []
+    for chunk in _balanced_objects(t):
+        for candidate in (chunk, re.sub(r",\s*([}\]])", r"\1", chunk)):
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                parsed.append(obj)
+                break
+    if not parsed:
+        return None
+    answers = [o for o in parsed if {"claim_status", "seg_id", "start_seg_id"} & set(o)]
+    return (answers or parsed)[-1]
+
+
+def _is_plain_json(text: Any) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except Exception:
+        return False
+
+
+# ==============================================================================
 # WARMUP FUNCTION
 # ==============================================================================
 def warmup_pipeline():
@@ -221,12 +357,12 @@ def warmup_pipeline():
     warmup_transcription()
     logger.info("Warming up Ollama (%s)...", OLLAMA_MODEL)
     try:
-        ollama_client.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            options={"num_predict": 1},
-            keep_alive=-1,
-        )
+        _chat([{"role": "user", "content": "ping"}], {"num_predict": 1}, use_format=False,
+              think=False if THINK is not None else None)
+        if RESCUE_MODEL:
+            logger.info("Warming up the rescue model (%s)...", RESCUE_MODEL)
+            _chat([{"role": "user", "content": "ping"}], {"num_predict": 1}, use_format=False,
+                  think=False, model=RESCUE_MODEL)
         logger.info("Ollama warmup complete.")
     except Exception as e:
         logger.warning("Ollama warmup encountered an issue: %s", e)
@@ -255,6 +391,14 @@ ANALYSIS_FIELDNAMES = [
     "final_seg_range",       # ids actually used after pairing / clamping
     "llm_quote",
     "asr_hints",
+    "run_id",                # rows of several runs can end up in one appended file
+    "llm_model",
+    "think_mode",            # default | 0 | 1
+    "think_chars",           # length of separately returned reasoning text (if any)
+    "rescue_model",
+    "rescue_status",         # verdict of the rescue model when it was asked
+    "rescue_used",           # True: the answer/evidence come from the rescue model
+    "rescue_ms",
     "llm_ms",                # stage-1 LLM time
     "chosen_overlap",        # claim-word overlap of the chosen sentence
     "lex_best_id",
@@ -540,7 +684,7 @@ def _second_look_llm(
     def show(i: int) -> str:
         return f'[S_{i}] "{segment_map[i]["text"][:200]}"'
 
-    tail = (
+    tail = _soft_switch(
         "Second check of the evidence sentence for the same claim. "
         f"Current choice: {show(chosen_id)}. "
         "Other sentences that share words with the claim: " + "; ".join(show(i) for i in offered) + ". "
@@ -548,20 +692,19 @@ def _second_look_llm(
         'Reply with JSON only: {"seg_id": <int>}'
     )
     try:
-        response = ollama_client.chat(
-            model=OLLAMA_MODEL,
-            messages=[
+        response = _chat(
+            [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
                 {"role": "assistant", "content": first_reply},
                 {"role": "user", "content": tail},
             ],
-            format="json",
-            options={"temperature": 0.0, "num_predict": 24, "num_ctx": NUM_CTX},
-            keep_alive=-1,
+            {"temperature": TEMPERATURE, "num_predict": 24, "num_ctx": NUM_CTX},
+            use_format=True,
+            think=False if THINK is not None else None,   # never reason in the tiny follow-up
         )
-        data = json.loads(response.message.content)
-        pick = _first_int(data.get("seg_id")) if isinstance(data, dict) else None
+        data = extract_json(response.message.content)
+        pick = _first_int(data.get("seg_id")) if data else None
     except Exception:
         logger.exception("Second-look LLM call failed; keeping the first choice")
         return None
@@ -743,30 +886,50 @@ def build_evidence_span(
 # LLM CALL
 # ==============================================================================
 def _query_llm(user_prompt: str, info: Dict[str, Any]) -> Optional[dict]:
-    """One retry on transport/JSON failure. Returns parsed dict or None."""
+    """One retry on transport/parse failure. Returns the parsed dict or None."""
     for attempt in range(2):
         try:
-            response = ollama_client.chat(
-                model=OLLAMA_MODEL,
-                messages=[
+            response = _chat(
+                [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                format="json",
-                options={
-                    "temperature": 0.0,
-                    "num_predict": 160,   # v1 used 80: could cut the JSON mid-string
-                    "num_ctx": NUM_CTX,
-                },
-                keep_alive=-1,
+                {"temperature": TEMPERATURE, "num_predict": NUM_PREDICT, "num_ctx": NUM_CTX},
+                use_format=not THINK,       # format=json and reasoning do not mix reliably
+                think=THINK,
             )
             raw_content = response.message.content
             info["raw_llm_json"] = raw_content
-            data = json.loads(raw_content)
-            if isinstance(data, dict):
+            info["think_chars"] = len(getattr(response.message, "thinking", None) or "")
+            data = extract_json(raw_content)
+            if data is not None:
                 return data
+            logger.warning("No JSON object in the model reply (attempt %d): %.120r", attempt + 1, raw_content)
         except Exception:
             logger.exception("Ollama query failed (attempt %d)", attempt + 1)
+    return None
+
+
+def _query_rescue(prompt: str) -> Optional[dict]:
+    """Same system prompt and claim, sent to the rescue model. One retry. Never raises."""
+    for attempt in range(2):
+        try:
+            response = _chat(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                {"temperature": 0.6 if RESCUE_THINK else 0.0,
+                 "num_predict": 1536 if RESCUE_THINK else 160, "num_ctx": NUM_CTX},
+                use_format=not RESCUE_THINK,
+                think=RESCUE_THINK,
+                model=RESCUE_MODEL,
+            )
+            data = extract_json(response.message.content)
+            if data is not None:
+                return data
+        except Exception:
+            logger.exception("Rescue model query failed (attempt %d)", attempt + 1)
     return None
 
 
@@ -790,12 +953,13 @@ def answer_question(
             + ".\n\n"
         )
 
-    user_prompt = (
+    base_prompt = (
         f"Transcript:\n\"\"\"\n{transcript_text}\n\"\"\"\n\n"
         f"Claim to verify: \"{question}\"\n\n"
         f"{hint_text}"
         "State if explicitly confirmed, contradicted, or not mentioned. Return JSON."
     )
+    user_prompt = _soft_switch(base_prompt)
 
     approx_tokens = (len(SYSTEM_PROMPT) + len(user_prompt)) / APPROX_CHARS_PER_TOKEN
     if approx_tokens > NUM_CTX * 0.9:
@@ -818,6 +982,14 @@ def answer_question(
         "final_seg_range": None,
         "llm_quote": None,
         "asr_hints": "; ".join(f"{q}={t}" for q, t in hints),
+        "run_id": RUN_ID,
+        "llm_model": OLLAMA_MODEL,
+        "think_mode": _think_env or "default",
+        "think_chars": None,
+        "rescue_model": RESCUE_MODEL,
+        "rescue_status": None,
+        "rescue_used": False,
+        "rescue_ms": None,
         "llm_ms": None,
         "chosen_overlap": None,
         "lex_best_id": None,
@@ -843,30 +1015,48 @@ def answer_question(
     t_llm = time.monotonic()
     data = _query_llm(user_prompt, info)
     info["llm_ms"] = int(1000 * (time.monotonic() - t_llm))
-    if data is None:
-        return False, None, info
 
-    claim_status = str(data.get("claim_status", "")).strip().upper()
-    raw_has_evidence = data.get("has_evidence")
-    if not isinstance(raw_has_evidence, bool):
-        raw_has_evidence = str(raw_has_evidence).strip().lower() == "true"
+    claim_status = ""
+    quote = None
+    if data is not None:
+        claim_status = str(data.get("claim_status", "")).strip().upper()
+        raw_has_evidence = data.get("has_evidence")
+        if not isinstance(raw_has_evidence, bool):
+            raw_has_evidence = str(raw_has_evidence).strip().lower() == "true"
 
-    quote = data.get("quote")
-    if quote is not None and not isinstance(quote, str):
-        quote = str(quote)
+        quote = data.get("quote")
+        if quote is not None and not isinstance(quote, str):
+            quote = str(quote)
 
-    info["llm_claim_status"] = claim_status
-    info["llm_has_evidence"] = raw_has_evidence
-    info["llm_rationale"] = data.get("rationale")
-    info["llm_quote"] = quote
-    info["llm_seg_id"] = _first_int(data.get("start_seg_id"), data.get("seg_id"), data.get("sentence_id"))
-    info["llm_end_seg_id"] = _first_int(data.get("end_seg_id"))
+        info["llm_claim_status"] = claim_status
+        info["llm_has_evidence"] = raw_has_evidence
+        info["llm_rationale"] = data.get("rationale")
+        info["llm_quote"] = quote
+        info["llm_seg_id"] = _first_int(data.get("start_seg_id"), data.get("seg_id"), data.get("sentence_id"))
+        info["llm_end_seg_id"] = _first_int(data.get("end_seg_id"))
 
     # In the v1 analysis CONFIRMED was never wrong on 195 negatives (0 false
     # positives), so the verdict alone decides the answer. has_evidence is only
     # logged; localisation problems must not flip a correct "yes" to "no".
+    used_rescue = False
     if claim_status != "CONFIRMED":
-        return False, None, info
+        if RESCUE_MODEL and (t_start is None or time.monotonic() - t_start < RESCUE_MAX_ELAPSED_SEC):
+            t_r = time.monotonic()
+            rdata = _query_rescue(_soft_switch(base_prompt, RESCUE_MODEL, RESCUE_THINK))
+            info["rescue_ms"] = int(1000 * (time.monotonic() - t_r))
+            info["rescue_status"] = str(rdata.get("claim_status", "")).strip().upper() if rdata else "ERROR"
+            if rdata is not None and info["rescue_status"] == "CONFIRMED":
+                used_rescue = True
+                data, claim_status = rdata, "CONFIRMED"
+                quote = rdata.get("quote")
+                if quote is not None and not isinstance(quote, str):
+                    quote = str(quote)
+                info["llm_quote"] = quote
+                info["llm_seg_id"] = _first_int(rdata.get("start_seg_id"), rdata.get("seg_id"), rdata.get("sentence_id"))
+                info["llm_end_seg_id"] = _first_int(rdata.get("end_seg_id"))
+        info["rescue_used"] = used_rescue
+        if claim_status != "CONFIRMED":
+            return False, None, info
 
     lo, hi, mode = resolve_evidence_range(data, quote, question, segment_map)
     if lo is None or hi is None:
@@ -889,7 +1079,7 @@ def answer_question(
         time_ok = t_start is None or (time.monotonic() - t_start) < S2_MAX_ELAPSED_SEC
         reason = second_look_reason(stage1_id, scores, segment_map)
         info["s2_reason"] = reason
-        if SECOND_LOOK_MODE in ("lexical", "llm") and reason and time_ok:
+        if SECOND_LOOK_MODE in ("lexical", "llm") and reason and time_ok and not used_rescue:
             new_id = stage1_id
             if SECOND_LOOK_MODE == "lexical":
                 if "lex_gap" in reason and others:
@@ -899,7 +1089,8 @@ def answer_question(
                 info["s2_offered"] = ",".join(str(i) for i in offered)
                 if offered:
                     t_s2 = time.monotonic()
-                    pick = _second_look_llm(user_prompt, info["raw_llm_json"], stage1_id, offered, segment_map)
+                    first_reply = info["raw_llm_json"] if _is_plain_json(info["raw_llm_json"]) else json.dumps(data)
+                    pick = _second_look_llm(user_prompt, first_reply, stage1_id, offered, segment_map)
                     info["s2_ms"] = int(1000 * (time.monotonic() - t_s2))
                     if pick is not None:
                         new_id = pick
