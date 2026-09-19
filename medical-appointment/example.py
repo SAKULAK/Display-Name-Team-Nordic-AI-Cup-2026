@@ -1,4 +1,23 @@
-"""ASR Question Answering pipeline using Ollama and word-level temporal snapping."""
+"""ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
+
+v2 - evidence spans tuned toward the ground-truth annotation style.
+
+What changed vs. v1 (see the analysis of 185 true positives):
+  * Evidence is the whole transcript sentence, not a 3-6 word quote.
+    Ground-truth spans are ~3.2 s / 9 words; v1 spans were ~1.8 s / 5 words
+    (mean IoU 0.50). Full sentences alone give ~0.56, plus a small boundary
+    pad ~0.58. Quote trimming did not help in any sentence-length bucket.
+  * The LLM may return a contiguous sentence RANGE (start_seg_id..end_seg_id)
+    so question+answer pairs and short confirmations can be captured, as the
+    ground truth often does (24% of GT spans cover 2+ sentences).
+  * Deterministic question/answer pairing for bare one-word replies.
+  * Bug fix: `seg_id or start_seg_id` treated sentence id 0 as missing and
+    silently turned a CONFIRMED claim into a "no" answer.
+  * A CONFIRMED verdict is never thrown away because localisation failed; the
+    sentence is recovered lexically instead.
+  * num_predict raised (80 tokens could truncate the JSON), one retry on bad JSON.
+  * Logs to a NEW csv (answers_v2.csv) because the schema changed.
+"""
 
 import csv
 import json
@@ -19,15 +38,48 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-OLLAMA_HOST = "http://127.0.0.1:13018"
+OLLAMA_HOST = "http://127.0.0.1:16614"
 OLLAMA_MODEL = "phi4"
-CSV_OUTPUT_PATH = "answers.csv"
+CSV_OUTPUT_PATH = "answers_v2.csv"   # new name: the column set changed
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
+
+# ---- Evidence-span policy (tuned on ground truth; re-tune when data changes) --
+# Positive START pad moves the start EARLIER, END pad moves the end LATER
+# (negative = earlier). Best values from a grid search with leave-one-transcript-
+# out CV: IoU 0.563 (raw sentence) -> 0.582. The effect is small (~0.02).
+SPAN_START_PAD_SEC = 0.1
+SPAN_END_PAD_SEC = -0.1
+
+# Evidence range limits (GT: 75% of spans <= 4.1 s, max 14 s).
+MAX_SPAN_SENTENCES = 3
+MAX_SPAN_SEC = 10.0
+
+# Question/answer pairing for bare replies ("None.", "Observation.", "Yes.").
+ENABLE_QA_PAIRING = True
+QA_SHORT_ANSWER_WORDS = 4     # target counts as a bare answer if <= this
+QA_SHORT_REPLY_WORDS = 6      # reply that follows a question sentence
+QA_MAX_GAP_SEC = 1.5          # max silence between the paired sentences
+
+# v1 trimmed the evidence to the quoted words. That LOWERED IoU (0.50 vs 0.56
+# for whole sentences), so it is off. Kept only for A/B comparison.
+USE_QUOTE_SNAPPING = False
+
+# Prompt option: accept synonyms/lay terms/ASR spelling variants of the SAME
+# entity (7 of the 10 v1 false negatives were paraphrase or spelling mismatches).
+# Re-run the hard-negative questions after enabling; v1 had 0 false positives.
+ALLOW_SYNONYM_MATCH = True
+
+APPROX_CHARS_PER_TOKEN = 3.5
+NUM_CTX = 4096
 
 # ==============================================================================
 # SYSTEM PROMPT
 # ==============================================================================
+_SYNONYM_RULE = """
+   - Same entity under a different name still counts as mentioned: lay terms vs medical terms ("long-term sugar value" = HbA1c), and ASR spelling variants of a drug or diagnosis ("Isomeprazole" ~ "Esomeprazole", "molluscum" ~ "molluscs"). Numbers, units, negation and side of the body must still match exactly.
+"""
+
 SYSTEM_PROMPT = """You are a strict clinical evidence verifier. Your task is to verify if a claim is factually TRUE and explicitly CONFIRMED by the transcript.
 
 CRITICAL RULES FOR VERIFICATION:
@@ -35,6 +87,7 @@ CRITICAL RULES FOR VERIFICATION:
    - If a doctor asks about a symptom or event ("Any fever?", "Does the pain radiate down your leg?", "Any known COVID exposure?"), and the patient answers "No", "None", or "Nothing like that" -> The claim that the patient had this symptom is CONTRADICTED.
    - If an exam finding is absent ("no pus", "no sores", "no redness", "no swelling", "no foreign body") -> Claims asserting the finding was present or seen are CONTRADICTED.
    - If a test was negative ("strep test was negative", "COVID test was negative") -> Claims asserting infection/bacteria found are CONTRADICTED.
+   - The reverse also holds: if the claim itself states an absence ("free of symptoms", "no side effects", "no foreign body") and the transcript confirms that absence, the claim is CONFIRMED.
 
 2. ANTONYMS & OPPOSITE FINDINGS (MUST be CONTRADICTED / has_evidence: false):
    - "Normal", "stable", "good", or "unchanged" CONTRADICTS claims of "abnormal", "impaired", "elevated", "unstable", or "worsened".
@@ -42,20 +95,25 @@ CRITICAL RULES FOR VERIFICATION:
 3. UNMENTIONED SPECIFIC ENTITIES (MUST be NOT_MENTIONED / has_evidence: false):
    - If a specific symptom, diagnosis, or entity was never named, it is NOT_MENTIONED.
    - Strict matching: "holiday" is not "weekend"; watching a television series is not a "specific hobby".
-
+{synonym_rule}
 4. EVIDENCE LOCALIZATION (Only if claim_status is CONFIRMED):
-   - Identify the single sentence [S_id] containing the direct proof.
-   - Extract the exact short quote (3 to 6 words) from that sentence directly stating the fact.
+   - Choose the sentence [S_id] that states the fact most directly and completely. If the same fact is stated several times, prefer the explicit statement (the clinician's finding, assessment or plan, or the patient's direct answer to the doctor's question) over a passing mention.
+   - Report start_seg_id and end_seg_id. Normally they are the SAME sentence id.
+   - If the chosen sentence is only a bare short answer ("None.", "Yes.", "No changes.", "Observation."), set start_seg_id to the question or statement right before it that gives the answer its meaning.
+   - If the chosen sentence is a question and the next short sentence is the reply that confirms it, set end_seg_id to that reply.
+   - Never span more than 3 consecutive sentences, and only include sentences that belong to the same statement.
+   - "quote" = the complete clause that states the fact, copied exactly from the transcript (not a 2-3 word fragment).
 
 OUTPUT STRICT VALID JSON:
-{
+{{
   "rationale": "<brief 3-7 words explaining if affirmed, denied with no, normal vs abnormal, or unmentioned>",
   "claim_status": "CONFIRMED" | "CONTRADICTED" | "NOT_MENTIONED",
   "has_evidence": true or false,
-  "seg_id": <int or null>,
-  "quote": "<exact short quote from transcript or null>"
-}
-"""
+  "start_seg_id": <int or null>,
+  "end_seg_id": <int or null>,
+  "quote": "<exact clause from transcript or null>"
+}}
+""".format(synonym_rule=_SYNONYM_RULE if ALLOW_SYNONYM_MATCH else "")
 
 # ==============================================================================
 # WARMUP FUNCTION
@@ -76,11 +134,51 @@ def warmup_pipeline():
         logger.warning("Ollama warmup encountered an issue: %s", e)
 
 
-# Run warmup immediately on import
 warmup_pipeline()
 
 # ==============================================================================
-# HELPER FUNCTIONS
+# QUALITATIVE LOGGING HELPER
+# ==============================================================================
+ANALYSIS_FIELDNAMES = [
+    "audio_filename",
+    "question",
+    "predicted_answer",
+    "final_start",
+    "final_end",
+    "span_duration_sec",
+    # NONE | SENTENCE | SENTENCE_QA_PAIR | LLM_RANGE | QUOTE_SNAPPED |
+    # LEXICAL_FALLBACK | ERROR
+    "alignment_mode",
+    "llm_claim_status",
+    "llm_has_evidence",
+    "llm_rationale",
+    "llm_seg_id",            # start id (kept for compatibility with v1 analysis)
+    "llm_end_seg_id",
+    "final_seg_range",       # ids actually used after pairing / clamping
+    "llm_quote",
+    "target_sentence_text",
+    "coarse_sent_start",
+    "coarse_sent_end",
+    "raw_llm_json",
+]
+
+
+def append_analysis_records(records: List[Dict[str, Any]], filepath: str = CSV_OUTPUT_PATH):
+    """Appends qualitative analysis records to CSV, creating headers if file doesn't exist."""
+    file_exists = os.path.isfile(filepath)
+    try:
+        with open(filepath, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=ANALYSIS_FIELDNAMES, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            for rec in records:
+                writer.writerow(rec)
+    except Exception as e:
+        logger.error("Failed to write qualitative analysis log: %s", e)
+
+
+# ==============================================================================
+# TRANSCRIPT HELPERS
 # ==============================================================================
 def parse_raw_data(transcribed_raw: Union[bytes, str, dict]) -> dict:
     if isinstance(transcribed_raw, dict):
@@ -93,165 +191,320 @@ def parse_raw_data(transcribed_raw: Union[bytes, str, dict]) -> dict:
 
 
 def format_indexed_transcript(raw_data: dict) -> Tuple[str, Dict[int, dict]]:
-  """Splits Whisper segments into distinct sentences using word timestamps.
+    lines = []
+    sentence_map = {}
+    sent_id = 0
 
-  Returns:
-      transcript_text: Formatted string of [S_0], [S_1], ... for the prompt.
-      sentence_map: Dict mapping int -> {"start": float, "end": float, "text":
-      str, "words": list}
-  """
-  lines = []
-  sentence_map = {}
-  sent_id = 0
+    for seg in raw_data.get("segments", []):
+        words = seg.get("words", [])
 
-  for seg in raw_data.get("segments", []):
-    words = seg.get("words", [])
+        if not words:
+            text = seg.get("text", "").strip()
+            if text:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", 0.0))
+                sentence_map[sent_id] = {
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                    "words": [],
+                }
+                lines.append(f"[S_{sent_id}] {text}")
+                sent_id += 1
+            continue
 
-    # Fallback: if WhisperX alignment didn't produce words for this segment,
-    # keep the raw segment as a single unit so nothing is lost.
-    if not words:
-      text = seg.get("text", "").strip()
-      if text:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", 0.0))
-        sentence_map[sent_id] = {
-            "start": start,
-            "end": end,
-            "text": text,
-            "words": [],
-        }
-        lines.append(f"[S_{sent_id}] {text}")
-        sent_id += 1
-      continue
-
-    curr_words = []
-    for w in words:
-      if "start" not in w or "end" not in w:
-        continue
-      curr_words.append(w)
-
-      # Break into a sentence on terminal punctuation (. ? !) or after 18 words
-      clean_token = w.get("word", "").strip()
-      is_terminal = (
-          bool(clean_token)
-          and clean_token[-1] in ".?!"
-          or len(curr_words) >= 18
-      )
-
-      if is_terminal and curr_words:
-        sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
-        sentence_map[sent_id] = {
-            "start": float(curr_words[0]["start"]),
-            "end": float(curr_words[-1]["end"]),
-            "text": sent_text,
-            "words": curr_words,
-        }
-        lines.append(f"[S_{sent_id}] {sent_text}")
-        sent_id += 1
         curr_words = []
+        for w in words:
+            if "start" not in w or "end" not in w:
+                continue
+            curr_words.append(w)
 
-    # Catch any leftover words in the segment
-    if curr_words:
-      sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
-      sentence_map[sent_id] = {
-          "start": float(curr_words[0]["start"]),
-          "end": float(curr_words[-1]["end"]),
-          "text": sent_text,
-          "words": curr_words,
-      }
-      lines.append(f"[S_{sent_id}] {sent_text}")
-      sent_id += 1
+            clean_token = w.get("word", "").strip()
+            is_terminal = (
+                bool(clean_token)
+                and clean_token[-1] in ".?!"
+                or len(curr_words) >= 18
+            )
 
-  return "\n".join(lines), sentence_map
+            if is_terminal and curr_words:
+                sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
+                sentence_map[sent_id] = {
+                    "start": float(curr_words[0]["start"]),
+                    "end": float(curr_words[-1]["end"]),
+                    "text": sent_text,
+                    "words": curr_words,
+                }
+                lines.append(f"[S_{sent_id}] {sent_text}")
+                sent_id += 1
+                curr_words = []
+
+        if curr_words:
+            sent_text = " ".join([cw.get("word", "").strip() for cw in curr_words])
+            sentence_map[sent_id] = {
+                "start": float(curr_words[0]["start"]),
+                "end": float(curr_words[-1]["end"]),
+                "text": sent_text,
+                "words": curr_words,
+            }
+            lines.append(f"[S_{sent_id}] {sent_text}")
+            sent_id += 1
+
+    return "\n".join(lines), sentence_map
+
+
+_STOPWORDS = {
+    "the", "a", "an", "of", "to", "in", "on", "at", "for", "and", "or", "is", "are",
+    "was", "were", "be", "been", "it", "this", "that", "with", "as", "by", "did",
+    "does", "do", "has", "have", "had", "patient", "your", "you", "i", "my", "any",
+    "will", "would", "should", "there", "their", "them", "they", "he", "she",
+}
+
+
+def _tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _content_tokens(text: str) -> set:
+    return {t for t in _tokens(text) if t not in _STOPWORDS}
+
+
+def _word_count(text: str) -> int:
+    return len(_tokens(text))
+
+
+def _first_int(*values: Any) -> Optional[int]:
+    """First value that contains an integer. Uses `is None`, NOT truthiness,
+    so sentence id 0 is valid (v1 dropped it via `x or y`)."""
+    for v in values:
+        if v is None or isinstance(v, bool):
+            continue
+        m = re.search(r"\d+", str(v))
+        if m:
+            return int(m.group())
+    return None
+
+
+def locate_sentence(
+    segment_map: Dict[int, dict],
+    quote: Optional[str],
+    question: str,
+    candidates: Optional[List[int]] = None,
+) -> Optional[int]:
+    """Recover the evidence sentence when the LLM id is missing or invalid.
+    Prefers the quote, then falls back to the question's content words."""
+    ids = candidates if candidates is not None else sorted(segment_map)
+    for probe, min_score in ((quote, 0.6), (question, 0.4)):
+        toks = _content_tokens(probe or "")
+        if not toks:
+            continue
+        best_id, best_score = None, 0.0
+        for sid in ids:
+            sent = segment_map.get(sid)
+            if sent is None:
+                continue
+            score = len(toks & _content_tokens(sent["text"])) / len(toks)
+            if score > best_score:
+                best_id, best_score = sid, score
+        if best_id is not None and best_score >= min_score:
+            return best_id
+    return None
+
+
+# ==============================================================================
+# EVIDENCE SPAN CONSTRUCTION
+# ==============================================================================
+def _range_times(lo: int, hi: int, segment_map: Dict[int, dict]) -> Tuple[float, float]:
+    return segment_map[lo]["start"], segment_map[hi]["end"]
+
+
+def apply_qa_pairing(lo: int, hi: int, segment_map: Dict[int, dict]) -> Tuple[int, int, bool]:
+    """Pair a bare reply with its question (or a question with its short reply).
+
+    Ground-truth spans often read "And any side effects at all? None." while a
+    single-sentence prediction would only cover "None.". Only fires for one
+    sentence and only for clear question/answer shapes, because blind padding
+    was measured to LOWER IoU.
+    """
+    if not ENABLE_QA_PAIRING or lo != hi:
+        return lo, hi, False
+
+    target = segment_map[lo]
+    text = target["text"].strip()
+
+    prev = segment_map.get(lo - 1)
+    if (
+        prev is not None
+        and _word_count(text) <= QA_SHORT_ANSWER_WORDS
+        and prev["text"].strip().endswith("?")
+        and 0.0 <= target["start"] - prev["end"] <= QA_MAX_GAP_SEC
+    ):
+        return lo - 1, hi, True
+
+    nxt = segment_map.get(hi + 1)
+    if (
+        nxt is not None
+        and text.endswith("?")
+        and _word_count(nxt["text"]) <= QA_SHORT_REPLY_WORDS
+        and 0.0 <= nxt["start"] - target["end"] <= QA_MAX_GAP_SEC
+    ):
+        return lo, hi + 1, True
+
+    return lo, hi, False
+
 
 def refine_span_with_words(
     quote: Optional[str],
     target_seg: dict,
     raw_data: dict,
 ) -> Optional[Tuple[float, float]]:
-  """Snaps an LLM quote to exact word-level timestamps from WhisperX alignment.
+    """v1 quote -> word-timestamp snapping. Only used if USE_QUOTE_SNAPPING."""
+    if not quote or not quote.strip():
+        return None
 
-  Returns (start, end) in seconds, or None if no reliable match is found.
-  """
-  if not quote or not quote.strip():
+    clean_quote = [re.sub(r"[^\w]", "", w).lower() for w in quote.split()]
+    clean_quote = [w for w in clean_quote if w]
+    if not clean_quote:
+        return None
+
+    def search_word_list(words_list: List[dict]) -> Optional[Tuple[float, float]]:
+        cleaned_words = []
+        for w in words_list:
+            cw = re.sub(r"[^\w]", "", w.get("word", "")).lower()
+            if cw and "start" in w and "end" in w:
+                cleaned_words.append((cw, float(w["start"]), float(w["end"])))
+
+        if not cleaned_words:
+            return None
+
+        q_len = len(clean_quote)
+
+        if len(cleaned_words) >= q_len:
+            best_score = 0.0
+            best_span = None
+
+            for i in range(len(cleaned_words) - q_len + 1):
+                window = [cleaned_words[i + k][0] for k in range(q_len)]
+                score = sum(1 for a, b in zip(clean_quote, window) if a == b) / q_len
+                if score > best_score and score >= 0.60:
+                    best_score = score
+                    best_span = (cleaned_words[i][1], cleaned_words[i + q_len - 1][2])
+                    if score == 1.0:
+                        return best_span
+
+            if best_span is not None and best_score >= 0.70:
+                return best_span
+
+        return None
+
+    # Restrict to the target sentence only: v1's global fallback could jump to a
+    # different mention of the phrase elsewhere in the conversation.
+    target_words = target_seg.get("words", [])
+    if target_words:
+        span = search_word_list(target_words)
+        if span and span[0] < span[1]:
+            return span
     return None
 
-  # Clean quote tokens: lowercase, strip all non-alphanumeric characters
-  clean_quote = [re.sub(r"[^\w]", "", w).lower() for w in quote.split()]
-  clean_quote = [w for w in clean_quote if w]
-  if not clean_quote:
+
+def resolve_evidence_range(
+    data: dict,
+    quote: Optional[str],
+    question: str,
+    segment_map: Dict[int, dict],
+) -> Tuple[Optional[int], Optional[int], str]:
+    """Turn the LLM's ids into a valid, bounded, contiguous sentence range."""
+    start_id = _first_int(data.get("start_seg_id"), data.get("seg_id"), data.get("sentence_id"))
+    end_id = _first_int(data.get("end_seg_id"), start_id)
+    if start_id is None:
+        start_id = end_id
+
+    ids_valid = (
+        start_id is not None
+        and end_id is not None
+        and start_id in segment_map
+        and end_id in segment_map
+    )
+
+    if not ids_valid:
+        located = locate_sentence(segment_map, quote, question)
+        if located is None:
+            return None, None, "NONE"
+        return located, located, "LEXICAL_FALLBACK"
+
+    lo, hi = sorted((start_id, end_id))
+    if not all(i in segment_map for i in range(lo, hi + 1)):
+        # non-contiguous ids (e.g. gaps in the map): keep the sentence that best matches
+        pick = locate_sentence(segment_map, quote, question, [start_id, end_id]) or start_id
+        return pick, pick, "SENTENCE"
+
+    too_many = (hi - lo + 1) > MAX_SPAN_SENTENCES
+    s, e = _range_times(lo, hi, segment_map)
+    too_long = (hi > lo) and (e - s) > MAX_SPAN_SEC
+    if too_many or too_long:
+        pick = locate_sentence(segment_map, quote, question, list(range(lo, hi + 1))) or lo
+        return pick, pick, "SENTENCE"
+
+    return lo, hi, ("LLM_RANGE" if hi > lo else "SENTENCE")
+
+
+def build_evidence_span(
+    lo: int,
+    hi: int,
+    mode: str,
+    quote: Optional[str],
+    segment_map: Dict[int, dict],
+    raw_data: dict,
+) -> Tuple[float, float, str, Tuple[int, int]]:
+    lo, hi, paired = apply_qa_pairing(lo, hi, segment_map)
+    if paired:
+        mode = "SENTENCE_QA_PAIR"
+
+    start, end = _range_times(lo, hi, segment_map)
+
+    if USE_QUOTE_SNAPPING and lo == hi:
+        snapped = refine_span_with_words(quote, segment_map[lo], raw_data)
+        if snapped:
+            start, end = snapped
+            mode = "QUOTE_SNAPPED"
+
+    # Small boundary correction learned from the ground truth.
+    p_start = max(0.0, start - SPAN_START_PAD_SEC)
+    p_end = end + SPAN_END_PAD_SEC
+    if p_end - p_start >= 0.3:
+        start, end = p_start, p_end
+
+    return start, end, mode, (lo, hi)
+
+
+# ==============================================================================
+# LLM CALL
+# ==============================================================================
+def _query_llm(user_prompt: str, info: Dict[str, Any]) -> Optional[dict]:
+    """One retry on transport/JSON failure. Returns parsed dict or None."""
+    for attempt in range(2):
+        try:
+            response = ollama_client.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                format="json",
+                options={
+                    "temperature": 0.0,
+                    "num_predict": 160,   # v1 used 80: could cut the JSON mid-string
+                    "num_ctx": NUM_CTX,
+                },
+                keep_alive=-1,
+            )
+            raw_content = response.message.content
+            info["raw_llm_json"] = raw_content
+            data = json.loads(raw_content)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            logger.exception("Ollama query failed (attempt %d)", attempt + 1)
     return None
-
-  def search_word_list(words_list: List[dict]) -> Optional[Tuple[float, float]]:
-    """Searches a list of WhisperX word dicts for the best quote match."""
-    # Extract only words that have valid start and end timestamps
-    cleaned_words = []
-    for w in words_list:
-      cw = re.sub(r"[^\w]", "", w.get("word", "")).lower()
-      if cw and "start" in w and "end" in w:
-        cleaned_words.append((cw, float(w["start"]), float(w["end"])))
-
-    if not cleaned_words:
-      return None
-
-    q_len = len(clean_quote)
-
-    # Strategy A: Sliding window over words
-    if len(cleaned_words) >= q_len:
-      best_score = 0.0
-      best_span = None
-
-      for i in range(len(cleaned_words) - q_len + 1):
-        window = [cleaned_words[i + k][0] for k in range(q_len)]
-        score = sum(1 for a, b in zip(clean_quote, window) if a == b) / q_len
-        if score > best_score and score >= 0.60:
-          best_score = score
-          best_span = (cleaned_words[i][1], cleaned_words[i + q_len - 1][2])
-          if score == 1.0:
-            return best_span
-
-      if best_span is not None and best_score >= 0.70:
-        return best_span
-
-    # Strategy B: Anchor on first and last word of the quote
-    first_tok = clean_quote[0]
-    last_tok = clean_quote[-1]
-
-    cand_starts = [s for (tok, s, e) in cleaned_words if tok == first_tok]
-    cand_ends = [e for (tok, s, e) in cleaned_words if tok == last_tok]
-
-    # Find the tightest valid span (must be > 0s and < 30s)
-    valid_spans = [
-        (s, e)
-        for s in cand_starts
-        for e in cand_ends
-        if 0.3 <= (e - s) <= 30.0 and s < e
-    ]
-    if valid_spans:
-      # Return the shortest valid span that fits
-      valid_spans.sort(key=lambda span: span[1] - span[0])
-      return valid_spans[0]
-
-    return None
-
-  # 1. Search inside the target segment first (avoids duplicate matches elsewhere)
-  target_words = target_seg.get("words", [])
-  if target_words:
-    span = search_word_list(target_words)
-    if span and span[0] < span[1]:
-      return span
-
-  # 2. Fallback: Search all words in the entire transcript
-  all_words = []
-  for seg in raw_data.get("segments", []):
-    all_words.extend(seg.get("words", []))
-
-  if all_words:
-    span = search_word_list(all_words)
-    if span and span[0] < span[1]:
-      return span
-
-  return None
 
 
 # ==============================================================================
@@ -260,7 +513,8 @@ def refine_span_with_words(
 def answer_question(
     raw_data: dict,
     question: str,
-) -> Tuple[bool, Optional[Span]]:
+) -> Tuple[bool, Optional[Span], Dict[str, Any]]:
+    """Answers question and returns (answer, span, qualitative_meta_dict)."""
     transcript_text, segment_map = format_indexed_transcript(raw_data)
 
     user_prompt = (
@@ -269,64 +523,76 @@ def answer_question(
         "State if explicitly confirmed, contradicted, or not mentioned. Return JSON."
     )
 
-    try:
-        response = ollama_client.chat(
-            model=OLLAMA_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            format="json",
-            options={
-                "temperature": 0.0,
-                "num_predict": 80,
-                "num_ctx": 4096,
-            },
-            keep_alive=-1,
-        )
-        data = json.loads(response.message.content)
-    except Exception:
-        logger.exception("Ollama query failed for question: %s", question)
-        return False, None
+    approx_tokens = (len(SYSTEM_PROMPT) + len(user_prompt)) / APPROX_CHARS_PER_TOKEN
+    if approx_tokens > NUM_CTX * 0.9:
+        logger.warning("Prompt ~%d tokens is close to num_ctx=%d; the transcript may be truncated.", approx_tokens, NUM_CTX)
+
+    info: Dict[str, Any] = {
+        "question": question,
+        "predicted_answer": False,
+        "final_start": None,
+        "final_end": None,
+        "span_duration_sec": None,
+        "alignment_mode": "NONE",
+        "llm_claim_status": None,
+        "llm_has_evidence": None,
+        "llm_rationale": None,
+        "llm_seg_id": None,
+        "llm_end_seg_id": None,
+        "final_seg_range": None,
+        "llm_quote": None,
+        "target_sentence_text": None,
+        "coarse_sent_start": None,
+        "coarse_sent_end": None,
+        "raw_llm_json": "",
+    }
+
+    data = _query_llm(user_prompt, info)
+    if data is None:
+        return False, None, info
 
     claim_status = str(data.get("claim_status", "")).strip().upper()
     raw_has_evidence = data.get("has_evidence")
     if not isinstance(raw_has_evidence, bool):
         raw_has_evidence = str(raw_has_evidence).strip().lower() == "true"
 
-    # Strict confirmation check
-    if not (raw_has_evidence and claim_status == "CONFIRMED"):
-        return False, None
-
-    # Handle segment ID
-    sent_id = data.get("sentence_id")
-    if sent_id is None:
-      sent_id = data.get("seg_id") or data.get("start_seg_id")
-
-    try:
-      sent_id = int(sent_id)
-    except (ValueError, TypeError):
-      return False, None
-
-    if sent_id not in segment_map:  # segment_map is your sentence_map
-      return False, None
-
-    target_sent = segment_map[sent_id]
-    coarse_start = target_sent["start"]
-    coarse_end = target_sent["end"]
-
-    # Refine within the target sentence using word timestamps
     quote = data.get("quote")
-    refined_span = refine_span_with_words(quote, target_sent, raw_data)
+    if quote is not None and not isinstance(quote, str):
+        quote = str(quote)
 
-    if refined_span and refined_span[0] < refined_span[1]:
-      start, end = refined_span
-    else:
-      # If quote matching fails, falling back to a 3-second sentence unit
-      # already yields ~0.70-0.85 tIoU!
-      start, end = coarse_start, coarse_end
+    info["llm_claim_status"] = claim_status
+    info["llm_has_evidence"] = raw_has_evidence
+    info["llm_rationale"] = data.get("rationale")
+    info["llm_quote"] = quote
+    info["llm_seg_id"] = _first_int(data.get("start_seg_id"), data.get("seg_id"), data.get("sentence_id"))
+    info["llm_end_seg_id"] = _first_int(data.get("end_seg_id"))
 
-    return True, (round(start, 3), round(end, 3))
+    # In the v1 analysis CONFIRMED was never wrong on 195 negatives (0 false
+    # positives), so the verdict alone decides the answer. has_evidence is only
+    # logged; localisation problems must not flip a correct "yes" to "no".
+    if claim_status != "CONFIRMED":
+        return False, None, info
+
+    lo, hi, mode = resolve_evidence_range(data, quote, question, segment_map)
+    if lo is None or hi is None:
+        info["predicted_answer"] = True     # confirmed, but no sentence could be located
+        info["alignment_mode"] = "NONE"
+        return True, None, info
+
+    start, end, mode, (lo, hi) = build_evidence_span(lo, hi, mode, quote, segment_map, raw_data)
+    info["target_sentence_text"] = " ".join(segment_map[i]["text"] for i in range(lo, hi + 1) if i in segment_map)
+    info["coarse_sent_start"] = round(segment_map[lo]["start"], 3)
+    info["coarse_sent_end"] = round(segment_map[hi]["end"], 3)
+    info["final_seg_range"] = f"{lo}-{hi}"
+
+    start_r, end_r = round(start, 3), round(end, 3)
+    info["predicted_answer"] = True
+    info["final_start"] = start_r
+    info["final_end"] = end_r
+    info["span_duration_sec"] = round(end_r - start_r, 3)
+    info["alignment_mode"] = mode
+
+    return True, (start_r, end_r), info
 
 
 # ==============================================================================
@@ -352,17 +618,33 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     answers = []
     evidence_start = []
     evidence_end = []
+    analysis_records = []
 
     for question in request.questions:
         try:
-            ans, span = answer_question(raw_result, question)
+            ans, span, info = answer_question(raw_result, question)
         except Exception:
             logger.exception("Error answering question: %s", question)
             ans, span = False, None
+            info = {
+                "question": question,
+                "predicted_answer": False,
+                "alignment_mode": "ERROR",
+                "llm_claim_status": "ERROR",
+                "llm_has_evidence": False,
+                "llm_rationale": "exception_raised",
+                "raw_llm_json": "",
+            }
+
+        info["audio_filename"] = request.audio_filename
+        analysis_records.append(info)
 
         answers.append(ans)
         evidence_start.append(span[0] if span is not None else None)
         evidence_end.append(span[1] if span is not None else None)
+
+    # Save details for qualitative error/span analysis
+    append_analysis_records(analysis_records, CSV_OUTPUT_PATH)
 
     return ASRQuestionResponseDto(
         answers=answers,
