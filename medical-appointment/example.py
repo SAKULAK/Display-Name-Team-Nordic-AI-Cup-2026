@@ -1,5 +1,14 @@
 """ASR Question Answering pipeline (Ollama + sentence-level evidence spans).
 
+v5.4 - two fixes from the rescue run (phi4 main + qwen3:14b rescue, score 0.775):
+  * Warmup now uses the SAME num_ctx and a realistic prompt length as the real calls. In every
+    run so far the first LLM call took 7-10 s (median 0.7 s) and the first rescue call 8.7 s,
+    i.e. the warmup did not leave the model in the state the real requests need. That cold start
+    lands on conversation 1 and probably explains most of the 44 s worst case.
+  * The fixed 40 s / 45 s cutoffs for the second look and the rescue are replaced by a projected
+    finish time: elapsed + remaining questions * 1.6 s + 10 s margin must stay under the 60 s
+    budget. The old cutoff skipped 3 second looks in sample_84 (slowest audio), costing 0.004 tIoU.
+
 v5.3 - optional verdict rescue by a second model (OFF unless QA_RESCUE_MODEL is set).
     QA_RESCUE_MODEL=qwen3:14b
   Whenever the main model does not return CONFIRMED (about 5 of 10 questions), the same prompt
@@ -94,7 +103,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 OLLAMA_HOST = "http://127.0.0.1:16614"
 OLLAMA_MODEL = os.environ.get("QA_MODEL", "phi4")
-CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v5.3.csv")   # new name: the column set changed
+CSV_OUTPUT_PATH = os.environ.get("QA_CSV", "answers_v5.4.csv")   # new name: the column set changed
 if os.environ.get("QA_CSV_RESET", "0") == "1" and os.path.isfile(CSV_OUTPUT_PATH):
     os.remove(CSV_OUTPUT_PATH)
 elif os.path.isfile(CSV_OUTPUT_PATH):
@@ -153,7 +162,6 @@ SECOND_LOOK_MODE = os.environ.get("QA_SECOND_LOOK", "llm").strip().lower()   # l
 S2_MIN_LEX_GAP = 0.25
 S2_SHORT_WORDS = 3
 S2_MAX_OFFERED = 2           # sentences offered to the LLM besides the chosen one
-S2_MAX_ELAPSED_SEC = 40.0    # skip the second look once the conversation has used this much time
 
 # Opt-in: prepend the previous sentence when the final evidence sentence is a very short reply.
 PREPEND_SHORT = os.environ.get("QA_PREPEND_SHORT", "1") == "1"
@@ -162,6 +170,14 @@ PREPEND_MAX_GAP_SEC = 1.5
 
 APPROX_CHARS_PER_TOKEN = 3.5
 NUM_CTX = 4096
+
+# ---- Time guard for the optional extra calls (second look, rescue) ----------------------
+# An extra call is made only if the conversation is projected to finish inside the budget:
+#   elapsed + remaining_questions * EST_SEC_PER_QUESTION + TIME_MARGIN_SEC < TIME_BUDGET_SEC
+# (stage-1 calls are never skipped; a single call has been seen to take up to ~9 s when cold.)
+TIME_BUDGET_SEC = float(os.environ.get("QA_TIME_BUDGET_SEC", "55"))
+TIME_MARGIN_SEC = 10.0
+EST_SEC_PER_QUESTION = 1.6     # stage 1 (~0.85 s) + rescue on ~half (~0.5 s) + second look on ~20% (~0.1 s)
 
 # ---- Model / reasoning support (e.g. qwen3:14b) --------------------------------------
 # QA_THINK unset -> the parameter is not sent (right for phi4)
@@ -178,7 +194,6 @@ RUN_ID = os.environ.get("QA_RUN_ID", time.strftime("%Y%m%d-%H%M%S"))
 # ---- Verdict rescue by a second model ---------------------------------------------------
 RESCUE_MODEL = os.environ.get("QA_RESCUE_MODEL", "qwen3:14b").strip()          # e.g. "qwen3:14b"; empty = off
 RESCUE_THINK = os.environ.get("QA_RESCUE_THINK", "0").strip().lower() not in ("0", "false", "off", "no", "")
-RESCUE_MAX_ELAPSED_SEC = 45.0    # skip the rescue once the conversation has used this much time
 
 # ==============================================================================
 # SYSTEM PROMPT
@@ -253,6 +268,14 @@ SYSTEM_PROMPT = build_system_prompt(ENABLE_LLM_RANGE, ALLOW_SYNONYM_MATCH)
 # ==============================================================================
 # LLM CALL HELPERS (reasoning-model tolerant)
 # ==============================================================================
+def _time_ok(t_start: Optional[float], remaining_questions: int = 0) -> bool:
+    """True if an optional extra call still fits the conversation's time budget."""
+    if t_start is None:
+        return True
+    projected = (time.monotonic() - t_start) + remaining_questions * EST_SEC_PER_QUESTION + TIME_MARGIN_SEC
+    return projected < TIME_BUDGET_SEC
+
+
 _THINK_UNSUPPORTED: set = set()      # models whose server/client rejected the think parameter
 _UNSET = object()
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -352,20 +375,37 @@ def _is_plain_json(text: Any) -> bool:
 # ==============================================================================
 # WARMUP FUNCTION
 # ==============================================================================
+def _warmup_ping(model: Optional[str], think: Optional[bool]) -> None:
+    """Same options as the real calls (num_ctx!) and a transcript-sized prompt, so the model is
+    left loaded exactly the way the first real request needs it. num_predict stays tiny."""
+    filler = " ".join(["This is a warm up sentence about a routine medical consultation."] * 60)
+    _chat(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Transcript:\n\"\"\"\n{filler}\n\"\"\"\n\nClaim to verify: \"warm up\"\nReturn JSON."},
+        ],
+        {"num_predict": 2, "num_ctx": NUM_CTX, "temperature": TEMPERATURE},
+        use_format=False,
+        think=think,
+        model=model,
+    )
+
+
 def warmup_pipeline():
     """Warms up WhisperX and Ollama at startup so Conversation 1 never times out."""
     warmup_transcription()
     logger.info("Warming up Ollama (%s)...", OLLAMA_MODEL)
-    try:
-        _chat([{"role": "user", "content": "ping"}], {"num_predict": 1}, use_format=False,
-              think=False if THINK is not None else None)
-        if RESCUE_MODEL:
-            logger.info("Warming up the rescue model (%s)...", RESCUE_MODEL)
-            _chat([{"role": "user", "content": "ping"}], {"num_predict": 1}, use_format=False,
-                  think=False, model=RESCUE_MODEL)
-        logger.info("Ollama warmup complete.")
-    except Exception as e:
-        logger.warning("Ollama warmup encountered an issue: %s", e)
+    targets = [(None, False if THINK is not None else None)]
+    if RESCUE_MODEL:
+        targets.append((RESCUE_MODEL, False))
+    for model, think in targets:
+        try:
+            if model:
+                logger.info("Warming up the rescue model (%s)...", model)
+            _warmup_ping(model, think)          # one failing model must not stop the other warming up
+        except Exception as e:
+            logger.warning("Ollama warmup of %s encountered an issue: %s", model or OLLAMA_MODEL, e)
+    logger.info("Ollama warmup complete.")
 
 
 warmup_pipeline()
@@ -940,6 +980,7 @@ def answer_question(
     raw_data: dict,
     question: str,
     t_start: Optional[float] = None,
+    remaining: int = 0,
 ) -> Tuple[bool, Optional[Span], Dict[str, Any]]:
     """Answers question and returns (answer, span, qualitative_meta_dict)."""
     transcript_text, segment_map = format_indexed_transcript(raw_data)
@@ -1040,7 +1081,7 @@ def answer_question(
     # logged; localisation problems must not flip a correct "yes" to "no".
     used_rescue = False
     if claim_status != "CONFIRMED":
-        if RESCUE_MODEL and (t_start is None or time.monotonic() - t_start < RESCUE_MAX_ELAPSED_SEC):
+        if RESCUE_MODEL and _time_ok(t_start, remaining):
             t_r = time.monotonic()
             rdata = _query_rescue(_soft_switch(base_prompt, RESCUE_MODEL, RESCUE_THINK))
             info["rescue_ms"] = int(1000 * (time.monotonic() - t_r))
@@ -1076,7 +1117,7 @@ def answer_question(
             info["lex_gap"] = round(scores[others[0]] - scores.get(stage1_id, 0.0), 3)
         info["cand_json"] = candidate_table(stage1_id, scores, segment_map)
 
-        time_ok = t_start is None or (time.monotonic() - t_start) < S2_MAX_ELAPSED_SEC
+        time_ok = _time_ok(t_start, remaining)
         reason = second_look_reason(stage1_id, scores, segment_map)
         info["s2_reason"] = reason
         if SECOND_LOOK_MODE in ("lexical", "llm") and reason and time_ok and not used_rescue:
@@ -1151,9 +1192,9 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     evidence_end = []
     analysis_records = []
 
-    for question in request.questions:
+    for q_idx, question in enumerate(request.questions):
         try:
-            ans, span, info = answer_question(raw_result, question, t0)
+            ans, span, info = answer_question(raw_result, question, t0, len(request.questions) - q_idx - 1)
         except Exception:
             logger.exception("Error answering question: %s", question)
             ans, span = False, None
