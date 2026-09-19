@@ -162,6 +162,46 @@ def _nearest_predator_distance(status: dict):
     return min(predator_distances) if predator_distances else None
 
 
+# Reward formulas (pure, unit-testable) 
+
+def fruit_approach_reward(prev_dist, curr_dist) -> float:
+    """Potential-based: positive for closing the gap to the nearest known fruit,
+    negative for increasing it. 0.0 if not tracked on both sides of the tick."""
+    if prev_dist is None or curr_dist is None:
+        return 0.0
+    return FRUIT_APPROACH_COEF * (prev_dist - curr_dist) / NORM_DIST
+
+
+def predator_avoid_reward(prev_dist, curr_dist) -> float:
+    """Mirror of fruit_approach_reward, sign flipped."""
+    if prev_dist is None or curr_dist is None:
+        return 0.0
+    return PREDATOR_AVOID_COEF * (curr_dist - prev_dist) / NORM_DIST
+
+
+def search_reward_and_ref(curr_pos: Tuple[float, float], ref_pos: Tuple[float, float]):
+    """Reward for how far curr_pos has drifted from the slow-following EMA reference
+    ref_pos, plus the updated reference for next tick. See SEARCH_COEF/SEARCH_EMA_ALPHA."""
+    gap = float(np.hypot(curr_pos[0] - ref_pos[0], curr_pos[1] - ref_pos[1]))
+    reward = SEARCH_COEF * min(gap, NORM_DIST) / NORM_DIST
+    new_ref = (
+        ref_pos[0] + SEARCH_EMA_ALPHA * (curr_pos[0] - ref_pos[0]),
+        ref_pos[1] + SEARCH_EMA_ALPHA * (curr_pos[1] - ref_pos[1]),
+    )
+    return reward, new_ref
+
+
+def spawn_reward(pre_spawn_energy: float) -> float:
+    """SPAWN_REWARD scaled by how much energy remains after the 100 spawn cost, or
+    0.0 if spawning wasn't actually possible (mirrors Environment.agent_step's own
+    `energy > 100` gate exactly)."""
+    if pre_spawn_energy <= 100:
+        return 0.0
+    remaining_energy = pre_spawn_energy - 100
+    safety_frac = float(np.clip(remaining_energy / SPAWN_SAFETY_MARGIN, 0.0, 1.0))
+    return SPAWN_REWARD * safety_frac
+
+
 def encode_observation(status: dict, sim_time_frac: float) -> np.ndarray:
     """Turn one agent's ObservationResponse dict into a fixed-size float32 vector.
 
@@ -306,12 +346,8 @@ class SurvivalEnv(gym.Env):
             move_distance, move_direction, turn_angle, spawn_agent = decode_action(
                 continuous_action, spawn_action, status["sprint_speed"]
             )
-            # Mirrors Environment.agent_step's own gate exactly, so this is exact,
-            # not a guess: `if spawn_agent and agent.energy > 100`.
-            if spawn_agent and status["energy"] > 100:
-                remaining_energy = status["energy"] - 100  # mirrors `agent.energy -= 100`
-                safety_frac = float(np.clip(remaining_energy / SPAWN_SAFETY_MARGIN, 0.0, 1.0))
-                spawn_reward_for[agent_id] = SPAWN_REWARD * safety_frac
+            if spawn_agent:
+                spawn_reward_for[agent_id] = spawn_reward(status["energy"])
             action_requests.append((agent_id, ActionRequest(
                 agent_id=agent_id,
                 move_distance=move_distance,
@@ -343,44 +379,28 @@ class SurvivalEnv(gym.Env):
 
             prev_dist = prev_fruit_dist.get(agent_id)
             curr_dist = _nearest_fruit_distance(status)
-            if prev_dist is not None and curr_dist is not None:
-                # Potential-based shaping: positive for closing the gap, negative for
-                # increasing it. No reward just for a fruit entering/leaving the sensed
-                # set (e.g. via turning) with no prior distance to compare against.
-                fruit_approach_reward = FRUIT_APPROACH_COEF * (prev_dist - curr_dist) / NORM_DIST
-            else:
-                fruit_approach_reward = 0.0
+            fruit_reward = fruit_approach_reward(prev_dist, curr_dist)
 
             prev_pred_dist = prev_predator_dist.get(agent_id)
             curr_pred_dist = _nearest_predator_distance(status)
-            if prev_pred_dist is not None and curr_pred_dist is not None:
-                # Mirror of fruit-approach, sign flipped: positive for increasing the gap
-                # to the nearest known predator, negative for closing it.
-                predator_avoid_reward = PREDATOR_AVOID_COEF * (curr_pred_dist - prev_pred_dist) / NORM_DIST
-            else:
-                predator_avoid_reward = 0.0
+            pred_reward = predator_avoid_reward(prev_pred_dist, curr_pred_dist)
 
             agent_obj = self.sim.env.agents_dict.get(agent_id)
             curr_pos = (agent_obj.x, agent_obj.y) if agent_obj is not None else None
             ref_pos = prev_search_ref.get(agent_id, curr_pos)
             if curr_pos is not None and ref_pos is not None:
-                gap = float(np.hypot(curr_pos[0] - ref_pos[0], curr_pos[1] - ref_pos[1]))
-                search_reward = SEARCH_COEF * min(gap, NORM_DIST) / NORM_DIST
-                updated_search_ref[agent_id] = (
-                    ref_pos[0] + SEARCH_EMA_ALPHA * (curr_pos[0] - ref_pos[0]),
-                    ref_pos[1] + SEARCH_EMA_ALPHA * (curr_pos[1] - ref_pos[1]),
-                )
+                explore_reward, updated_search_ref[agent_id] = search_reward_and_ref(curr_pos, ref_pos)
             else:
-                search_reward = 0.0
+                explore_reward = 0.0
 
-            spawn_reward = spawn_reward_for.get(agent_id, 0.0)
+            agent_spawn_reward = spawn_reward_for.get(agent_id, 0.0)
 
             rewards[agent_id] = (
                 ENERGY_SHAPING_COEF * energy_delta
-                + fruit_approach_reward
-                + search_reward
-                + predator_avoid_reward
-                + spawn_reward
+                + fruit_reward
+                + explore_reward
+                + pred_reward
+                + agent_spawn_reward
             )
             obs[agent_id] = encode_observation(status, sim_time_frac)
             terminated[agent_id] = False
@@ -391,8 +411,8 @@ class SurvivalEnv(gym.Env):
             # No obs entry: the agent is gone and must not be carried forward into
             # next tick's action selection Still credit a successful spawn even if the same
             # tick's predator/energy check killed this agent right after.
-            spawn_reward = spawn_reward_for.get(agent_id, 0.0)
-            rewards[agent_id] = DEATH_PENALTY + spawn_reward
+            agent_spawn_reward = spawn_reward_for.get(agent_id, 0.0)
+            rewards[agent_id] = DEATH_PENALTY + agent_spawn_reward
             terminated[agent_id] = True
             truncated[agent_id] = False
             infos[agent_id] = {}
