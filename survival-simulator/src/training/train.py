@@ -72,6 +72,11 @@ CHECKPOINT_PATH = "checkpoints/policy.pt"
 # a bigger deal in wall-clock terms than it was at a small N_ENVS.
 CHECKPOINT_EVERY = 5
 
+# Caps per-episode-finish print()s per update - see the call site for why (short
+# episodes can mean hundreds of episode-finish events in one update, and each print
+# is a blocking write syscall under -u).
+MAX_EPISODE_LOGS_PER_UPDATE = 20
+
 
 @dataclass
 class Trajectory:
@@ -313,6 +318,11 @@ def load_checkpoint(model: ActorCritic, optimizer: optim.Optimizer) -> int:
 def train():
     random.seed(0)
     torch.manual_seed(0)
+    # The model is small (hidden_dim=128) and runs on GPU when one's available, so
+    # this main process gets little from multi-threaded CPU BLAS - but left at its
+    # default (often the whole node's core count, uncapped by --cpus-per-task on
+    # some HPC setups), it competes with N_ENVS worker processes for the same cores.
+    torch.set_num_threads(1)
 
     # Created before the model/optimizer so no CUDA context exists yet when worker
     # processes are spawned (relevant on an HPC box with a GPU)
@@ -358,12 +368,21 @@ def train():
             ]
             mean_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
 
-            for summary in episode_summaries:
+            # Capped per update: with -u (unbuffered, needed so logs show up live on
+            # HPC) each print is a blocking write syscall. Early in training - or
+            # after any population-wiping regression - episodes can end in the
+            # hundreds per update, and printing every single one measurably adds to
+            # update wall-clock time on a networked HPC filesystem for little benefit
+            # (the aggregate progress line below already covers the trend).
+            for i, summary in enumerate(episode_summaries):
                 total_episodes += 1
-                print(
-                    f"  [episode {total_episodes} finished] score={summary['score']:.2f} "
-                    f"agents_alive={summary['num_agents']} sim_time={summary['sim_time']:.1f}s"
-                )
+                if i < MAX_EPISODE_LOGS_PER_UPDATE:
+                    print(
+                        f"  [episode {total_episodes} finished] score={summary['score']:.2f} "
+                        f"agents_alive={summary['num_agents']} sim_time={summary['sim_time']:.1f}s"
+                    )
+            if len(episode_summaries) > MAX_EPISODE_LOGS_PER_UPDATE:
+                print(f"  ... and {len(episode_summaries) - MAX_EPISODE_LOGS_PER_UPDATE} more episodes this update")
 
             # Aggregate across the N_ENVS parallel envs for one representative progress line.
             known = [info for info in latest_info_per_env if info]

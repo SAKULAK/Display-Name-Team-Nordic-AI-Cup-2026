@@ -10,14 +10,26 @@ all N_ENVS replies - the actual env.step() computation overlaps across
 worker processes while we wait, instead of happening one env at a time.
 """
 import multiprocessing as mp
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
 
-from src.training.gym_env import SurvivalEnv
-
 
 def _worker(remote, worker_env_remote):
+    # Must happen before numpy/gym_env are imported below - BLAS backends read these
+    # at init time, not at use time. Without this, each of N_ENVS worker processes'
+    # numpy defaults to spinning up one BLAS thread per core on the node, so with
+    # many worker processes all doing that at once you get massive oversubscription
+    # (hundreds/thousands of threads fighting over whatever --cpus-per-task actually
+    # granted), which gets worse on a many-core HPC node, not better. Each worker
+    # only ever does small elementwise numpy ops one env at a time, so it never
+    # benefits from multi-threaded BLAS in the first place - mirrors rl/workers.py,
+    # which hit and fixed this same issue in the teammate's separate implementation.
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = "1"
+    from src.training.gym_env import SurvivalEnv
+
     worker_env_remote.close()  # only the parent uses this end
     env = SurvivalEnv()
     while True:
