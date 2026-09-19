@@ -1,7 +1,7 @@
 import pygame
 import random
 from src.core import SimulationCore
-from src.utils.controllers.dummy_agent_policy import action_decision
+from src.utils.controllers.learning_agent_policy import action_decision
 
 def local_simulation(verbose=True):
     seed = None
