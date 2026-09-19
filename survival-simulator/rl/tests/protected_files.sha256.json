@@ -1,0 +1,23 @@
+{
+  "agent_server.py": "6ac3232442a854e832b2ba766556b98027bfbd02c9a49246112c7339959d33e4",
+  "benchmark_evolution.py": "43526141ad42f13a72d4824c9386acdb6725df763936dc0b116925558b0a2f29",
+  "local_playground.py": "9a9a766e0935ff7e99befe7ab1af7f361f809907e82288ca6bb9e2b257ad339f",
+  "requirements.txt": "3b9f5843d9f006e7d1f51965bd884c1986019c6932fab453c9acdc1c5bc7474c",
+  "simulation_server.py": "efe6495846ee35a373a3ae8c288a902e1bb9b6954eb38d95d44ac0adbc63c7cf",
+  "src/core.py": "5e34e42aae65b542fc5a08c7e9392e117156d5df06ec0755f7191a7af1e9d17e",
+  "src/elements/agent.py": "dc4f2dd1822e37194f1eeed9a744a2158d1a0f1f5ea9a22e743481a1c4941202",
+  "src/elements/biome.py": "eb7aeb35a2fb35c60db57fc08195ae4ea8b48d3a53484c4b36f774102318ad4d",
+  "src/elements/creature.py": "c5a56ad203feef64a861f2a8f2b8e01017ac6a03031857f046199727a2b85c13",
+  "src/elements/environment.py": "330210ee2f2a0e9e5674139f836a1ae71c8ea090e871601c075e864bd830f986",
+  "src/elements/fruit.py": "070306871872585dfc9784455adb95bb0a3fec2c7649c5fa76a0d7eb1e84fb2d",
+  "src/elements/obstacle.py": "5a01e5a890d1ab99f74ddf0fc7999c11fe015ef5c6a7ef7ab730c294965d620a",
+  "src/elements/predator.py": "6035f4e088a09d47fcacc15d913b5075c25c6b734eed4f16ab080f6769c041e3",
+  "src/elements/tree.py": "97943fec031efddb18522630cd3eb2dbc84b5f6c5021a6a6816f966f065d9031",
+  "src/utils/controllers/cooperative_policy.py": "252e55d2f9c0467e0e2dacae47773c83866cca697f16402e4cf06c7309183b1a",
+  "src/utils/controllers/dummy_agent_policy.py": "5d3f8bb1cb5865d5f73b7329efa3516ffafa55d3516741714595345efeb64b4e",
+  "src/utils/controllers/evolution_agent_policy.py": "8b8400d059a729ff7afb11110eef9d9dedd1d60c33189eb1940620110a803c0b",
+  "src/utils/DTOs.py": "6f6b5d55a17c92b6c967e8fa79f990515de24728dd164f7bf90fc9c4b4f93980",
+  "src/utils/policy_visualization.py": "b9ccd43b9c4dbaf5050af98d8ff98636d9cf606e7f14cfadb7bc283c02519ea8",
+  "src/utils/sensing.py": "7522e83490f9e5891830a44ff05cbfe29a039bc265b0e1f63d2cb95a48ca0a44",
+  "src/utils/simulation.py": "f458e2e324d7d5c8d1af4db38097f1fbdeedc7c2d29ff0dd56d820c154b4b861"
+}

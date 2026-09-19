@@ -1,34 +1,22 @@
-"""A baseline that answers the protocol correctly and detects almost nothing.
-
-The point of this file is the plumbing, not the accuracy: it shows you how to
-decode a view, lift boxes out of that view into the frame-global coordinates
-the evaluator expects, and drive the camera without ever sending an illegal
-command. Replace ``detect`` with your model and ``choose_next_view`` with your
-camera policy.
-
-It is stateless. Each response contains the detections made on the view that
-arrived with that request, so at Level 1 and Level 2 it reports only the region
-the camera is pointed at, while a frame's ground truth covers the whole source
-frame.
-
-Run ``python local_evaluator.py`` to see what it scores. It will be close to
-zero, which is the honest starting point.
-"""
+"""YOLO detection with the baseline camera policy and response protocol."""
 
 import logging
-from typing import Dict, List, Optional, Tuple
+import os
+import math
+from typing import Dict, List, Optional
 
-import cv2
 import numpy as np
 
 from dtos import (
     MAXIMUM_CENTER_DELTA_PIXELS,
+    FULL_FRAME_CENTER,
     DroneFlybyPredictionDto,
     DroneFlybyPredictRequestDto,
     DroneFlybyPredictResponseDto,
     RequestedViewDto,
 )
-from utils import clip_bbox_to_frame, decode_view, view_bbox_to_global
+from utils import decode_view
+from detector import get_detector
 
 logger = logging.getLogger(__name__)
 
@@ -66,81 +54,12 @@ def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDt
     )
 
 
-### DUMMY MODEL ###
-
-# A placeholder class for the proposals below. Anything you report has to be
-# one of the names in dtos.OBJECT_CLASSES, spelled exactly.
-PLACEHOLDER_CLASS = 'jammer'
-
-MINIMUM_BOX_PIXELS = 8
-MAXIMUM_BOX_PIXELS = 320
-MAXIMUM_PROPOSALS = 20
-
-
 def detect(
     image: np.ndarray,
     request: DroneFlybyPredictRequestDto,
 ) -> List[DroneFlybyPredictionDto]:
-    """Propose boxes around whatever stands out from the ground.
-
-    This is edge detection, not object detection: it has no idea what it is
-    looking at, so it labels everything ``jammer`` with low confidence. It exists
-    to show the coordinate conversion on real data. Swap it out.
-
-    It takes the request as well as the image because a detection is made in
-    view coordinates and has to be answered in frame-global ones, and the
-    geometry for that conversion lives on the request.
-    """
-    height, width = image.shape[:2]
-    source_region = request.view.source_region_xyxy
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(grey, (3, 3), 0), 60, 180)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    proposals: List[Tuple[float, Tuple[int, int, int, int]]] = []
-    for contour in contours:
-        x, y, box_width, box_height = cv2.boundingRect(contour)
-        longest = max(box_width, box_height)
-        if longest < MINIMUM_BOX_PIXELS or longest > MAXIMUM_BOX_PIXELS:
-            continue
-        # Compactness stands in for "looks like a thing" here.
-        area_ratio = cv2.contourArea(contour) / float(box_width * box_height or 1)
-        proposals.append((area_ratio, (x, y, box_width, box_height)))
-
-    proposals.sort(key=lambda item: item[0], reverse=True)
-
-    annotations: List[DroneFlybyPredictionDto] = []
-    for area_ratio, (x, y, box_width, box_height) in proposals[:MAXIMUM_PROPOSALS]:
-        # Boxes leave your model in the pixels of this 960x540 image. Two
-        # steps put them in response coordinates: normalize to the view, then
-        # lift that through source_region_xyxy into frame-global coordinates.
-        view_bbox = (
-            x / width,
-            y / height,
-            (x + box_width) / width,
-            (y + box_height) / height,
-        )
-        bbox = clip_bbox_to_frame(
-            view_bbox_to_global(
-                view_bbox,
-                source_region,
-                request.original_width,
-                request.original_height,
-            )
-        )
-        # clip_bbox_to_frame returns None when nothing survives clipping. Drop
-        # those: one degenerate box invalidates the entire response.
-        if bbox is None:
-            continue
-        annotations.append(
-            DroneFlybyPredictionDto(
-                object_id=PLACEHOLDER_CLASS,
-                bbox=list(bbox),
-                confidence=round(min(0.30, 0.05 + 0.25 * area_ratio), 4),
-            )
-        )
-    return annotations
+    """Run the trained detector and return frame-global predictions."""
+    return get_detector().detect(image, request)
 
 
 ### DUMMY CAMERA POLICY ###
@@ -150,7 +69,37 @@ def detect(
 _sweep_direction: Dict[str, int] = {}
 
 
-def choose_next_view(
+def choose_next_view(request):
+    mode = os.environ.get('CAMERA_POLICY', 'hold_full').strip().lower()
+    if mode == 'baseline_sweep':
+        return baseline_sweep(request)
+    if mode != 'hold_full':
+        raise ValueError(f'Unknown CAMERA_POLICY: {mode!r}')
+    current, constraints = request.view, request.camera_constraints
+    if current.resolution_level == 0:
+        return None
+    # The official L2 constraints exclude L0: return through L1 first.
+    target = 0 if 0 in constraints.allowed_resolution_levels else 1
+    if target not in constraints.allowed_resolution_levels:
+        return None
+    bounds = constraints.bounds_for_level(target)
+    if bounds is None:
+        return None
+    if target == 0:
+        x, y = FULL_FRAME_CENTER
+    else:
+        x = min(max(current.center_x, bounds.minimum_center_x), bounds.maximum_center_x)
+        y = min(max(current.center_y, bounds.minimum_center_y), bounds.maximum_center_y)
+    if not (bounds.minimum_center_x <= x <= bounds.maximum_center_x and
+            bounds.minimum_center_y <= y <= bounds.maximum_center_y):
+        return None
+    exempt = target == 0 and constraints.full_view_reset_exempt_from_delta
+    if not exempt and math.hypot(x-current.center_x, y-current.center_y) > constraints.maximum_center_delta:
+        return None
+    return RequestedViewDto(resolution_level=target, center_x=int(x), center_y=int(y))
+
+
+def baseline_sweep(
     request: DroneFlybyPredictRequestDto,
 ) -> Optional[RequestedViewDto]:
     """Sweep sideways at the deepest zoom the camera can reach right now.

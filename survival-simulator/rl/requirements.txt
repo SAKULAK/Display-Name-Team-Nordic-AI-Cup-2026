@@ -1,0 +1,5 @@
+-r ../requirements.txt
+torch>=2.6,<3
+# Optional metrics integrations:
+tensorboard>=2.18,<3
+psutil>=6,<8

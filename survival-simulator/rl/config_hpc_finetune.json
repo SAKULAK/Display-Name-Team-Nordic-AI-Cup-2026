@@ -1,0 +1,32 @@
+{
+  "hidden_sizes": [
+    256,
+    256
+  ],
+  "rollout_steps": 128,
+  "minibatch_size": 1024,
+  "epochs": 6,
+  "gamma": 0.9995,
+  "gae_lambda": 0.95,
+  "clip": 0.2,
+  "learning_rate": 0.0001,
+  "energy_shaping": 0.0,
+  "extinction_penalty": 5.0,
+  "horizon_bonus": 5.0,
+  "checkpoint_seconds": 900,
+  "validation_seconds": 1800,
+  "max_hours": 6,
+  "device": "auto",
+  "output_dir": "rl/runs/hpc_finetune",
+  "validation_policy_mode": "stochastic",
+  "validation_policy_rollouts": 3,
+  "validation_policy_seed_base": 20260918,
+  "validation_seeds": [
+    2147483648,
+    2147483649,
+    2147483650,
+    2147483651,
+    2147483652
+  ],
+  "base_seed": 1000000
+}
