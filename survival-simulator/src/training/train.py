@@ -26,7 +26,7 @@ from src.training.vec_env import SubprocVecSurvivalEnv
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-N_ENVS = 8                 # parallel SurvivalEnv instances collected into each rollout
+N_ENVS = 60                # parallel SurvivalEnv instances collected into each rollout
 TOTAL_UPDATES = 10000      # number of PPO update iterations (training is fully resumable via checkpoints, so this is just a cap)
 ROLLOUT_TICKS = 256        # env ticks collected per rollout, per env (x N_ENVS transitions/update)
 GAMMA = 0.99

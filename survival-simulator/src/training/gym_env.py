@@ -269,7 +269,8 @@ class SurvivalEnv(gym.Env):
         env_height: int = 1200,
         chunk_size: int = 400,
         starting_agents: int = 5,
-        starting_predators: int = 0,
+        #was 0 at the start
+        starting_predators: int = 1,
         starting_fruits=None,
         starting_trees: int = 50,
         dt: float = 1 / 10,
