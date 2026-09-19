@@ -236,7 +236,7 @@ class FocusTests(unittest.TestCase):
         result = self.policy.process(request(3, 1, cx=960, cy=540), [])
         self.assertEqual(result.annotations, [])
 
-    def test_live_replaces_memory_and_suppresses_duplicates(self):
+    def test_same_class_target_updates_confidence_with_duplicate_live(self):
         self.policy.process(request(), [detection(confidence=0.99)])
         live = detection(confidence=0.7)
         duplicate = detection(box=(0.101, 0.101, 0.121, 0.121), confidence=0.6)
@@ -314,7 +314,7 @@ class FocusTests(unittest.TestCase):
         live = detection(box=(0.49, 0.1, 0.5, 0.12), confidence=0.7)
         self.policy.process(request(), [remembered])
         result = self.policy.process(request(1, 1, cx=960, cy=540), [live])
-        self.assertEqual(result.annotations, [live, remembered])
+        self.assertEqual(result.annotations, [remembered])
         self.assertEqual(result.replaced, 0)
 
     def test_return_obeys_supplied_constraints(self):
@@ -349,7 +349,7 @@ class FocusTests(unittest.TestCase):
             with patch.object(example, 'detect', side_effect=RuntimeError('fixture')), \
                     self.assertLogs(example.logger, level='ERROR'):
                 result = example.predict(request(1, 1))
-            self.assertEqual(result.annotations, [])
+            self.assertEqual(result.annotations, [detection()])
             self.assertEqual(result.requested_view.resolution_level, 0)
 
     def test_new_sequence_resets_even_if_detection_fails(self):
@@ -444,15 +444,15 @@ class FocusTests(unittest.TestCase):
             self.assertIn(field, text)
         self.assertEqual(len(result.annotations), 2)
 
-    def test_bridge_logs_protocol_cap_loss(self):
+    def test_bridge_cap_preserves_every_saved_object(self):
         old = [detection(box=(i/1000, 0.1, i/1000+0.0005, 0.101)) for i in range(500)]
         self.policy.process(request(), old)
         fresh = detection('tank', (0.3, 0.3, 0.32, 0.32), 0.99)
         with self.assertLogs('focus_policy', level='INFO') as logs:
             result = self.policy.process(request(1, 1, cx=960, cy=540), [fresh])
         self.assertEqual(len(result.annotations), 500)
-        self.assertIs(result.annotations[0], fresh)
-        self.assertIn('snapshot_overflow=1', '\n'.join(logs.output))
+        self.assertEqual(result.annotations, old)
+        self.assertIn('snapshot_overflow=0', '\n'.join(logs.output))
 
     def test_confirmed_trajectory_survives_track_id_change_and_expires(self):
         old = [detection(), detection('tank', (0.3, 0.3, 0.32, 0.32), 0.99),
@@ -496,7 +496,7 @@ class FocusTests(unittest.TestCase):
 
     def test_max_focus_confidence_boundary_and_latest_examples(self):
         for name, confidence, eligible in [('ta-ta', 0.164, True), ('small_launcher', 0.351, True),
-                ('spacecraft', 0.141, False), ('ta-ta', 0.677, False), ('small_launcher', 0.104, True),
+                ('spacecraft', 0.141, False), ('ta-ta', 0.677, False), ('small_launcher', 0.104, False),
                 ('mine_roller', 0.45, True), ('mine_roller', 0.45001, False)]:
             with self.subTest(name=name, confidence=confidence):
                 result = FocusPolicy(FocusConfig(min_l0_frames=1)).process(
@@ -574,7 +574,7 @@ class FocusTests(unittest.TestCase):
             [detection('tank', (0.305, 0.3, 0.345, 0.34))], 4)
         self.assertEqual(result, (None,))
 
-    def test_weak_incidental_match_keeps_saved_box_but_target_live_wins(self):
+    def test_incidental_detections_do_not_add_and_target_keeps_geometry(self):
         policy = FocusPolicy(FocusConfig(min_l0_frames=1))
         saved = detection('jet_plane', (0.3, 0.3, 0.32, 0.32), 0.99)
         policy.process(request(), [detection(confidence=0.2), saved])
@@ -583,19 +583,264 @@ class FocusTests(unittest.TestCase):
         new_object = detection('helicopter', (0.4, 0.4, 0.42, 0.42), 0.8)
         with self.assertLogs('focus_policy', level='INFO') as logs:
             result = policy.process(request(1, 1, cx=960, cy=540), [target_live, weak_incidental, new_object])
-        self.assertEqual(result.annotations, [target_live, new_object, saved])
+        self.assertEqual(result.annotations, [detection(confidence=0.9), saved])
         text = '\n'.join(logs.output)
-        for field in ('FOCUS_BRIDGE_CLASSES frame=1', 'propagated={"jet_plane":1}',
-                      'live_replaced={"mine_roller":1}', 'live_added={"helicopter":1}', 'live_rejected=1'):
+        for field in ('snapshot_count=2', 'snapshot_kept=1', 'target_updated=1',
+                      'target_removed=0', 'final_count=2', 'live_added=0'):
             self.assertIn(field, text)
 
-    def test_strong_incidental_same_class_can_replace(self):
+    def test_strong_incidental_same_class_cannot_replace(self):
         saved = detection('large_tower', (0.3, 0.3, 0.34, 0.34), 0.9)
         self.policy.process(request(), [detection(), saved])
         fresh = detection('large_tower', (0.301, 0.3, 0.341, 0.34), 0.95)
         result = self.policy.process(request(1, 1, cx=960, cy=540), [fresh])
-        self.assertEqual(result.replaced, 1)
-        self.assertIs(result.annotations[0], fresh)
+        self.assertEqual(result.replaced, 0)
+        self.assertEqual(result.annotations, [detection(), saved])
+
+    def test_sub_015_requires_previous_same_class_geometric_l0(self):
+        for confidence, previous, eligible in [
+                (0.149, None, False),
+                (0.149, detection(confidence=0.149), True),
+                (0.150, None, True),
+                (0.149, detection('tank', confidence=0.149), False),
+                (0.149, detection(box=(0.4, 0.4, 0.42, 0.42), confidence=0.149), False)]:
+            with self.subTest(confidence=confidence, previous=previous):
+                policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+                if previous is not None:
+                    policy.process(request(0), [previous])
+                result = policy.process(request(1), [detection(confidence=confidence)])
+                self.assertEqual(result.requested_view is not None, eligible)
+
+    def test_persistence_uses_motion_and_actual_l0_gap(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=2))
+        old = [detection(confidence=0.149)] + [
+            detection(name, (x, 0.3, x+0.02, 0.32)) for name, x in
+            [('tank', 0.3), ('jammer', 0.5), ('helicopter', 0.7)]]
+        policy.process(request(2), old)
+        current = [detection(d.object_id, (d.bbox[0]+0.06, d.bbox[1],
+                                          d.bbox[2]+0.06, d.bbox[3]), d.confidence) for d in old]
+        self.assertIsNotNone(policy.process(request(5), current).requested_view)
+        self.assertAlmostEqual(policy.states['one'].dx, 0.02)
+
+    def test_l1_and_older_l0_cannot_supply_persistence(self):
+        for middle_level in (0, 1):
+            policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+            policy.process(request(0), [detection(confidence=0.149)])
+            policy.process(request(1, middle_level), [] if middle_level == 0 else
+                           [detection(confidence=0.99)])
+            if middle_level == 1:
+                # Last authoritative L0 was empty; L1 evidence must not replace it.
+                policy.process(request(2), [])
+            self.assertIsNone(policy.process(request(3), [detection(confidence=0.149)]).requested_view)
+
+    def test_target_updates_preserve_projected_geometry_and_count(self):
+        for name, confidence, accepted in [
+                ('mine_roller', 0.69, True), ('mine_roller', 0.10, True),
+                ('tank', 0.70, True), ('tank', 0.699, False)]:
+            with self.subTest(name=name, confidence=confidence):
+                policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+                saved = [detection('jammer', (0.3, 0.3, 0.34, 0.34), 0.81),
+                         detection(confidence=0.2)]
+                policy.process(request(), saved)
+                policy.states['one'].dx = 0.001
+                predicted = [0.101, 0.1, 0.121, 0.12]
+                fresh = detection(name, (0.102, 0.1, 0.122, 0.12), confidence)
+                with self.assertLogs('focus_policy', level='INFO') as logs:
+                    result = policy.process(request(1, 1, cx=960, cy=540), [fresh])
+                self.assertEqual(len(result.annotations), 2)
+                self.assertEqual(result.annotations[1].bbox, predicted)
+                self.assertEqual(result.annotations[1].object_id, name if accepted else 'mine_roller')
+                self.assertEqual(result.annotations[1].confidence, confidence if accepted else 0.2)
+                self.assertIn('reclassification_accepted=' +
+                              str(accepted and name != 'mine_roller').lower(), '\n'.join(logs.output))
+                self.assertFalse(any(c.object_id == 'mine_roller'
+                                     for c in policy.states['one'].confirmations))
+
+    def test_high_confidence_reclassification_requires_strong_geometry(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+        saved = detection(confidence=0.2)
+        policy.process(request(), [saved])
+        result = policy.process(request(1, 1, cx=960, cy=540),
+                                [detection('tank', (0.108, 0.1, 0.128, 0.12), 0.99)])
+        self.assertEqual(result.annotations, [saved])
+
+    def test_unmatched_removal_boundary_and_exact_accounting(self):
+        for confidence, removed in [(0.10, True), (0.149, True), (0.15, True), (0.15001, False)]:
+            with self.subTest(confidence=confidence):
+                policy = FocusPolicy(FocusConfig(min_l0_frames=2))
+                saved = [detection('jammer', (0.3, 0.3, 0.32, 0.32), 0.10),
+                         detection(confidence=confidence),
+                         detection('tank', (0.4, 0.4, 0.42, 0.42), 0.9)]
+                policy.process(request(0), saved)
+                self.assertIsNotNone(policy.process(request(1), saved).requested_view)
+                with self.assertLogs('focus_policy', level='INFO') as logs:
+                    result = policy.process(request(2, 1, cx=960, cy=540), [])
+                self.assertEqual(result.annotations, [saved[0], saved[2]] if removed else saved)
+                for field in ('snapshot_count=3', 'target_updated=0',
+                              f'target_removed={int(removed)}', f'snapshot_kept={3-int(removed)}',
+                              f'final_count={3-int(removed)}', 'snapshot_clipped_out=0'):
+                    self.assertIn(field, '\n'.join(logs.output))
+
+    def test_non_target_immutability_with_individual_and_global_motion(self):
+        policy, current = self.velocity_fixture()
+        state = policy.states['one']
+        expected = []
+        for saved, velocity in zip(current, state.focus_snapshot.edge_velocities):
+            v = velocity if velocity is not None else (state.dx, state.dy, state.dx, state.dy)
+            expected.append(saved.model_copy(update={'bbox': [b+d for b, d in zip(saved.bbox, v)]}))
+        live = [d.model_copy(update={'confidence': 0.99}) for d in expected[1:]]
+        live += [detection('helicopter', (0.4, 0.4, 0.42, 0.42), 0.999),
+                 detection('tank', expected[2].bbox, 0.999)]
+        # Include incidental boxes in the supplied crop to exercise the association path.
+        zoom = request(5, 1)
+        zoom.view.source_region_xyxy = [0, 0, 3840, 2160]
+        result = policy.process(zoom, live)
+        self.assertEqual(result.annotations, expected)
+
+    def test_target_match_cannot_claim_neighbor(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+        saved = [detection(confidence=0.2),
+                 detection('tank', (0.11, 0.1, 0.13, 0.12), 0.6)]
+        policy.process(request(), saved)
+        result = policy.process(request(1, 1, cx=960, cy=540),
+                                [detection('tank', saved[1].bbox, 0.99)])
+        self.assertEqual(result.annotations, saved)
+
+    def test_predict_calls_begin_before_detect_once_and_caches_retry(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=1))
+        events = []
+        begin, process = policy.begin_request, policy.process
+        def on_begin(r):
+            events.append('begin')
+            begin(r)
+        def on_detect(image, r):
+            events.append('detect')
+            return [detection(confidence=0.2)]
+        def on_process(r, live):
+            events.append('process')
+            return process(r, live)
+        with patch.dict(os.environ, {'CAMERA_POLICY': 'focus_l1'}), \
+                patch.object(example, 'focus_policy', policy), \
+                patch.object(policy, 'begin_request', side_effect=on_begin), \
+                patch.object(policy, 'process', side_effect=on_process), \
+                patch.object(example, 'decode_view', return_value=None), \
+                patch.object(example, 'detect', side_effect=on_detect) as detect_mock:
+            first = example.predict(request())
+            second = example.predict(request())
+        self.assertEqual(events, ['begin', 'detect', 'process']*2)
+        self.assertEqual(detect_mock.call_count, 2)
+        self.assertEqual(first, second)
+        self.assertEqual(policy.states['one'].full_refreshes, 1)
+
+    def test_baseline_sweep_does_not_access_focus_policy(self):
+        with patch.dict(os.environ, {'CAMERA_POLICY': 'baseline_sweep',
+                                    'FOCUS_MIN_L0_FRAMES': 'invalid'}), \
+                patch.object(example.focus_policy, 'begin_request', side_effect=AssertionError), \
+                patch.object(example.focus_policy, 'process', side_effect=AssertionError), \
+                patch.object(example, 'decode_view', return_value=None), \
+                patch.object(example, 'detect', return_value=[detection()]):
+            r = request()
+            result = example.predict(r)
+            self.assertEqual(result.annotations, [detection()])
+            self.assertEqual(result.requested_view, example.baseline_sweep(r))
+
+    def test_missing_snapshot_never_emits_live_incidentals(self):
+        result = self.policy.process(request(1, 1), [detection('tank', confidence=0.99)])
+        self.assertEqual(result.annotations, [])
+        self.assertEqual(result.requested_view.resolution_level, 0)
+
+    def test_custom_confirmation_threshold_controls_reclassification(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=1, confirmation_confidence=0.85))
+        saved = detection(confidence=0.2)
+        policy.process(request(), [saved])
+        result = policy.process(request(1, 1, cx=960, cy=540),
+                                [detection('tank', confidence=0.84)])
+        self.assertEqual(result.annotations, [saved])
+
+    def test_failed_l1_removes_only_persistent_weak_target(self):
+        policy = FocusPolicy(FocusConfig(min_l0_frames=2))
+        saved = [detection(confidence=0.10), detection('tank', (0.3, 0.3, 0.32, 0.32))]
+        policy.process(request(0), saved)
+        policy.process(request(1), saved)
+        with patch.dict(os.environ, {'CAMERA_POLICY': 'focus_l1'}), \
+                patch.object(example, 'focus_policy', policy), \
+                patch.object(example, 'decode_view', return_value=None), \
+                patch.object(example, 'detect', side_effect=RuntimeError('fixture')) as mocked, \
+                self.assertLogs(example.logger, level='ERROR'):
+            result = example.predict(request(2, 1, cx=960, cy=540))
+        mocked.assert_called_once()
+        self.assertEqual(result.annotations, [saved[1]])
+        self.assertEqual(result.requested_view.resolution_level, 0)
+
+
+class FocusEligibilityConfigTests(unittest.TestCase):
+    def test_defaults_preserve_six_classes_and_confidence_range(self):
+        expected = {'small_launcher', 'ta-ta', 'mine_roller', 'hangar',
+                    'medium_launcher', 'medium_plane'}
+        with patch.dict(os.environ, {}, clear=True):
+            for config in (FocusConfig(), FocusConfig.from_env()):
+                self.assertEqual(config.focus_classes, expected)
+                self.assertEqual(config.min_focus_conf, 0.0)
+                self.assertEqual(config.max_focus_conf, 0.45)
+
+    def test_ta_ta_allowlist_is_the_only_eligible_class(self):
+        from dtos import OBJECT_CLASSES
+        with patch.dict(os.environ, {'FOCUS_CLASSES': 'ta-ta',
+                                    'FOCUS_MIN_L0_FRAMES': '1'}, clear=True):
+            for name in OBJECT_CLASSES:
+                with self.subTest(name=name):
+                    result = FocusPolicy().process(request(), [detection(name, confidence=0.4)])
+                    self.assertEqual(result.requested_view is not None, name == 'ta-ta')
+                    self.assertEqual(result.annotations, [detection(name, confidence=0.4)])
+                    if result.requested_view is not None:
+                        self.assertEqual(result.requested_view.resolution_level, 1)
+
+    def test_comma_separated_allowlist_parsing(self):
+        for value, expected in [(' ta-ta, , hangar ,ta-ta,unknown, ',
+                                 {'ta-ta', 'hangar', 'unknown'}), (' , ', set())]:
+            with self.subTest(value=value), patch.dict(os.environ, {'FOCUS_CLASSES': value}, clear=True):
+                self.assertEqual(FocusConfig.from_env().focus_classes, expected)
+
+    def test_minimum_and_maximum_are_inclusive_and_logged(self):
+        with patch.dict(os.environ, {'FOCUS_CLASSES': 'ta-ta', 'FOCUS_MIN_CONF': '0.35',
+                                    'FOCUS_MAX_CONF': '0.45', 'FOCUS_MIN_L0_FRAMES': '1'}, clear=True):
+            for confidence, eligible in [(0.349999, False), (0.35, True),
+                                         (0.4101, True), (0.45, True), (0.450001, False)]:
+                with self.subTest(confidence=confidence), self.assertLogs('focus_policy', level='INFO') as logs:
+                    policy = FocusPolicy()
+                    result = policy.process(request(), [detection('ta-ta', confidence=confidence)])
+                self.assertEqual(result.requested_view is not None, eligible)
+                for field in ('min_focus_conf=0.350', 'max_focus_conf=0.450', 'focus_classes=ta-ta'):
+                    self.assertIn(field, '\n'.join(logs.output))
+                if eligible:
+                    self.assertEqual(result.requested_view.resolution_level, 1)
+                    self.assertEqual(policy.process(request(1, 1), []).requested_view.resolution_level, 0)
+
+    def test_invalid_confidence_ranges_raise(self):
+        for minimum, maximum in [('-0.1', '0.45'), ('1.1', '0.45'), ('nan', '0.45'),
+                                 ('0.46', '0.45'), ('0', '-0.1'), ('0', '1.1'), ('0', 'nan')]:
+            with self.subTest(minimum=minimum, maximum=maximum), patch.dict(os.environ,
+                    {'FOCUS_MIN_CONF': minimum, 'FOCUS_MAX_CONF': maximum}, clear=True):
+                with self.assertRaises(ValueError):
+                    FocusConfig.from_env()
+        with self.assertRaises(ValueError):
+            FocusConfig(min_focus_conf=0.46, max_focus_conf=0.45)
+
+    def test_hold_full_ignores_new_focus_settings(self):
+        with patch.dict(os.environ, {'CAMERA_POLICY': 'hold_full', 'FOCUS_CLASSES': 'ta-ta',
+                                    'FOCUS_MIN_CONF': 'invalid'}, clear=True), \
+                patch.object(example, 'focus_policy', FocusPolicy()) as policy, \
+                patch.object(policy, 'begin_request', side_effect=AssertionError), \
+                patch.object(policy, 'process', side_effect=AssertionError), \
+                patch.object(example, 'decode_view', return_value=None), \
+                patch.object(example, 'detect', return_value=[detection()]):
+            for level in (0, 1):
+                result = example.predict(request(level=level))
+                self.assertEqual(result.annotations, [detection()])
+                if level == 0:
+                    self.assertIsNone(result.requested_view)
+                else:
+                    self.assertEqual(result.requested_view.resolution_level, 0)
 
 
 if __name__ == '__main__':

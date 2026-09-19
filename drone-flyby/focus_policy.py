@@ -1,4 +1,4 @@
-"""One L1 inspection between authoritative L0 refreshes; no detector changes.
+"""Target-only L1 confirmation between authoritative L0 refreshes.
 
 Boxes and motion use frame-global normalized coordinates. Velocity is measured
 per source-frame number, not per received request, so skipped frames count.
@@ -8,8 +8,6 @@ Configuration and the scoring formula are deliberately local to this module.
 import logging
 import math
 import os
-import json
-from collections import Counter
 from dataclasses import dataclass, field
 from statistics import median
 from threading import Lock
@@ -60,10 +58,15 @@ class FocusConfig:
     incidental_min_iou: float = 0.65
     incidental_center_fraction: float = 0.25
     incidental_match_margin: float = 0.1
+    focus_classes: frozenset[str] = FOCUS_CLASSES
+    min_focus_conf: float = 0.0
 
     @classmethod
     def from_env(cls):
         return cls(
+            focus_classes=(frozenset(name.strip() for name in os.environ['FOCUS_CLASSES'].split(',')
+                                     if name.strip()) if 'FOCUS_CLASSES' in os.environ else FOCUS_CLASSES),
+            min_focus_conf=float(os.environ.get('FOCUS_MIN_CONF', '0.0')),
             min_l0_frames=int(os.environ.get('FOCUS_MIN_L0_FRAMES', '3')),
             max_focus_conf=float(os.environ.get('FOCUS_MAX_CONF', '0.45')),
             minimum_focus_score=float(os.environ.get('FOCUS_MIN_SCORE', '1.2')),
@@ -78,6 +81,10 @@ class FocusConfig:
     def __post_init__(self):
         if not 0 <= self.max_focus_conf <= 1:
             raise ValueError('FOCUS_MAX_CONF must be in [0, 1]')
+        if not 0 <= self.min_focus_conf <= 1:
+            raise ValueError('FOCUS_MIN_CONF must be in [0, 1]')
+        if self.min_focus_conf > self.max_focus_conf:
+            raise ValueError('FOCUS_MIN_CONF must not exceed FOCUS_MAX_CONF')
         if type(self.confirmed_frames) is not int or self.confirmed_frames < 1:
             raise ValueError('FOCUS_CONFIRMED_FRAMES must be a positive integer')
         if not 0 <= self.confirmation_confidence <= 1:
@@ -427,20 +434,25 @@ class FocusPolicy:
         state.last_full_detections = live
         state.last_full_frame = request.frame
         state.full_refreshes += 1
-        state.l0_frames_since_focus += 1
+        state.l0_frames_since_focus += int(bool(live))
         state.cooldowns = [r for r in state.cooldowns
                            if state.full_refreshes-r.refresh <= max(self.config.stale_horizon, self.config.cooldown_refreshes)]
         state.focus_target = None
         candidates = []
         eligible_scores = []
         confirmed_count = 0
-        class_filtered = confidence_filtered = 0
-        for track in state.tracks:
-            if track.detection.object_id not in FOCUS_CLASSES:
+        class_filtered = confidence_filtered = persistence_filtered = 0
+        for index, track in enumerate(state.tracks):
+            if track.detection.object_id not in self.config.focus_classes:
                 class_filtered += 1
                 continue
-            if track.detection.confidence > self.config.max_focus_conf:
+            if not self.config.min_focus_conf <= track.detection.confidence <= self.config.max_focus_conf:
                 confidence_filtered += 1
+                continue
+            # Reliable matching uses only the immediately previous authoritative L0,
+            # with global motion and the actual source-frame gap.
+            if track.detection.confidence < 0.15 and edge_velocities[index] is None:
+                persistence_filtered += 1
                 continue
             age = self._focus_age(state, track, request.frame)
             if age is not None and age <= self.config.cooldown_refreshes:
@@ -466,7 +478,8 @@ class FocusPolicy:
             skip = 'no_detections'
         elif not eligible_scores:
             skip = ('class_filter' if class_filtered == len(live) else
-                    'confidence_filter' if class_filtered+confidence_filtered == len(live) else 'cooldown')
+                    'confidence_filter' if class_filtered+confidence_filtered == len(live) else
+                    'persistence_filter' if persistence_filtered else 'cooldown')
         elif max(eligible_scores) < self.config.minimum_focus_score:
             skip = 'no_target_above_threshold'
         else:
@@ -481,14 +494,16 @@ class FocusPolicy:
         logger.info('frame=%s L0 detections=%s focus=%s conf=%.3f center=%s score=%.3f '
                     'memory=0 expired=%s replaced=%s cleared=%s dx=%.3f dy=%.3f '
                     'l0_frames=%s min_l0_frames=%s skip=%s threshold=%.3f best_score=%.3f confirmed_penalized=%s '
-                    'class_filtered=%s confidence_filtered=%s max_focus_conf=%.3f',
+                    'class_filtered=%s confidence_filtered=%s max_focus_conf=%.3f '
+                    'min_focus_conf=%.3f focus_classes=%s',
                     request.frame, len(live), target.object_id if target else 'none',
                     target.confidence if target else 0.0,
                     (command.center_x, command.center_y) if command else None, score,
                     expired, replaced, cleared, state.dx*request.original_width, state.dy*request.original_height,
                     state.l0_frames_since_focus, self.config.min_l0_frames, skip,
                     self.config.minimum_focus_score, max(eligible_scores, default=0.0), confirmed_count,
-                    class_filtered, confidence_filtered, self.config.max_focus_conf)
+                    class_filtered, confidence_filtered, self.config.max_focus_conf,
+                    self.config.min_focus_conf, ','.join(sorted(self.config.focus_classes)))
         return FocusDecision(live, command, expired=expired, replaced=replaced, cleared=cleared)
 
     def _duplicate(self, a, b):
@@ -498,16 +513,15 @@ class FocusPolicy:
         return (iou(a.bbox, b.bbox) >= self.config.duplicate_iou or
                 math.dist(center(a.bbox), center(b.bbox)) <= max(0.002, diagonal*self.config.duplicate_center_fraction))
 
-    def _strong_incidental_match(self, old, fresh):
-        if old.object_id != fresh.object_id or iou(old.bbox, fresh.bbox) < self.config.incidental_min_iou:
+    def _strong_spatial_match(self, old, fresh):
+        if iou(old.bbox, fresh.bbox) < self.config.incidental_min_iou:
             return False
         diagonal = min(math.hypot(d.bbox[2]-d.bbox[0], d.bbox[3]-d.bbox[1]) for d in (old, fresh))
         return math.dist(center(old.bbox), center(fresh.bbox)) <= diagonal*self.config.incidental_center_fraction
 
     @staticmethod
     def _possibly_same_object(a, b):
-        # Conservative novelty gate, intentionally class-agnostic. Uncertain
-        # incidental labels should not create a second answer for a saved object.
+        # Class-agnostic association guards against claiming a saved neighbor.
         diagonal = min(math.hypot(d.bbox[2]-d.bbox[0], d.bbox[3]-d.bbox[1]) for d in (a, b))
         return (iou(a.bbox, b.bbox) >= 0.1 or
                 math.dist(center(a.bbox), center(b.bbox)) <= max(0.002, diagonal*0.5))
@@ -555,15 +569,10 @@ class FocusPolicy:
             state.last_focused_region = list(target.detection.bbox)
         state.focus_target = None
         state.focus_operations += 1
-        # Only deduplicate live against live. Never NMS the snapshot against itself.
-        unique_live = []
-        for detection in sorted(live, key=lambda d: (-d.confidence, d.object_id, tuple(d.bbox))):
-            if not any(self._duplicate(detection, other) for other in unique_live):
-                unique_live.append(detection)
         source = request.view.source_region_xyxy
         region = (source[0]/request.original_width, source[1]/request.original_height,
                   source[2]/request.original_width, source[3]/request.original_height)
-        observed_live = [d for d in unique_live if intersection(d.bbox, region) > 0]
+        observed_live = [d for d in live if intersection(d.bbox, region) > 0]
         snapshot = state.focus_snapshot if not state.snapshot_used else None
         status = 'ready' if snapshot is not None else ('consumed' if state.snapshot_used else 'missing')
         original_count = len(snapshot.annotations) if snapshot else 0
@@ -588,68 +597,54 @@ class FocusPolicy:
                         bbox=list(box), confidence=float(detection.confidence))
             state.snapshot_used = True
         predicted_target = propagated.get(snapshot.target_index) if snapshot else None
-        matched = (self._match_target(target, observed_live, state, request, predicted_target.bbox)
+        # A target match must not claim a different snapshot object's location.
+        target_live = []
+        if predicted_target is not None and intersection(predicted_target.bbox, region) > 0:
+            for fresh in observed_live:
+                overlap = iou(predicted_target.bbox, fresh.bbox)
+                distance = math.dist(center(predicted_target.bbox), center(fresh.bbox))
+                if any(index != snapshot.target_index and
+                       self._possibly_same_object(old, fresh) and
+                       (iou(old.bbox, fresh.bbox) >= overlap or
+                        math.dist(center(old.bbox), center(fresh.bbox)) <= distance)
+                       for index, old in propagated.items()):
+                    continue
+                target_live.append(fresh)
+        matched = (self._match_target(target, target_live, state, request, predicted_target.bbox)
                    if predicted_target is not None else None)
-
-        # One live box can replace at most one saved object. The selected target
-        # gets first claim; only its verified spatial match may change its class.
-        replaced, used_live = set(), set()
-        if (snapshot is not None and matched is not None and snapshot.target_index in propagated and
-                intersection(propagated[snapshot.target_index].bbox, region) > 0):
-            replaced.add(snapshot.target_index)
-            used_live.add(next(i for i, d in enumerate(unique_live) if d is matched))
-        pairs = []
-        for old_index, old in propagated.items():
-            if old_index in replaced or intersection(old.bbox, region) <= 0:
-                continue
-            for live_index, fresh in enumerate(unique_live):
-                if (live_index not in used_live and intersection(fresh.bbox, region) > 0 and
-                        self._strong_incidental_match(old, fresh)):
-                    pairs.append((1-iou(old.bbox, fresh.bbox), old_index, live_index))
-        for old_index, live_index in unambiguous_pairs(pairs, self.config.incidental_match_margin):
-            replaced.add(old_index)
-            used_live.add(live_index)
-        accepted_live = [d for index, d in enumerate(unique_live) if index in used_live]
-        added = []
-        for index, fresh in enumerate(unique_live):
-            if index in used_live:
-                continue
-            if (not any(self._possibly_same_object(fresh, d) for d in propagated.values()) and
-                    not any(self._possibly_same_object(fresh, d) for d in accepted_live)):
-                accepted_live.append(fresh)
-                added.append(fresh)
-        live_rejected = len(unique_live)-len(accepted_live)
-        kept = [d for index, d in propagated.items() if index not in replaced]
-        overflow = max(0, len(accepted_live)+len(kept)-500)
-        if overflow:
-            kept = kept[:max(0, 500-len(accepted_live))]
-        annotations = accepted_live+kept
-        # Tracker identity remains available for the next L0 refresh. It is never
-        # the source of this frame's annotations, and TTL/decay cannot delete them.
-        state.remembered_emitted += len(kept)
+        same_class = matched is not None and matched.object_id == predicted_target.object_id
+        reclassified = bool(matched is not None and not same_class and
+            matched.confidence >= self.config.confirmation_confidence and
+            self._strong_spatial_match(predicted_target, matched))
+        updated = bool(same_class or reclassified)
+        removed = bool(predicted_target is not None and matched is None and
+                       predicted_target.confidence <= 0.15)
+        accepted = None
+        if updated:
+            accepted = predicted_target.model_copy(update={
+                'object_id': matched.object_id, 'confidence': matched.confidence})
+            propagated[snapshot.target_index] = accepted
+        elif removed:
+            del propagated[snapshot.target_index]
+        annotations = list(propagated.values())[:500]
+        kept = len(annotations)-int(updated)
+        state.remembered_emitted += kept
         command = return_to_full(request)
-        self._confirm(state, target, matched, request.frame)
+        self._confirm(state, target, accepted, request.frame)
         logger.info('FOCUS_BRIDGE frame=%s snapshot_count=%s live_count=%s snapshot_kept=%s '
-                    'snapshot_replaced=%s final_count=%s dx=%.3f dy=%.3f snapshot_clipped_out=%s '
-                    'snapshot_overflow=%s source_frame_gap=%s snapshot_status=%s live_duplicates=%s '
-                    'live_candidates=%s live_rejected=%s',
-                    request.frame, original_count, len(accepted_live), len(kept), len(replaced), len(annotations),
-                    state.dx*request.original_width, state.dy*request.original_height, clipped_out,
-                    overflow, gap, status, len(live)-len(unique_live), len(unique_live), live_rejected)
-        def class_counts(detections):
-            return json.dumps(dict(sorted(Counter(d.object_id for d in detections).items())), separators=(',', ':'))
-        logger.info('FOCUS_BRIDGE_CLASSES frame=%s propagated=%s live_replaced=%s live_added=%s '
-                    'individual_velocity=%s global_fallback=%s', request.frame, class_counts(kept),
-                    class_counts([unique_live[i] for i in sorted(used_live)]), class_counts(added),
+                    'target_updated=%s target_removed=%s snapshot_replaced=%s final_count=%s '
+                    'snapshot_clipped_out=%s snapshot_overflow=0 source_frame_gap=%s snapshot_status=%s '
+                    'individual_velocity=%s global_fallback=%s live_added=0',
+                    request.frame, original_count, len(live), kept, int(updated), int(removed),
+                    int(updated), len(annotations), clipped_out, gap, status,
                     individual_velocity, global_fallback)
-        logger.info('frame=%s L1 live=%s memory_count=%s memory_expired=0 memory_replaced=%s '
-                    'dx_per_frame=%.3f dy_per_frame=%.3f frame_gap=%s returning=%s '
-                    'focus_operations=%s memory_average=%.3f', request.frame, len(accepted_live),
-                    len(kept), len(replaced), state.dx*request.original_width, state.dy*request.original_height,
-                    state.motion_frame_gap, 'L0' if command else 'blocked', state.focus_operations,
-                    state.remembered_emitted/state.focus_operations)
-        self._log_outcome(target, matched, request, len(kept))
-        return FocusDecision(annotations, command, len(kept), replaced=len(replaced), cleared=clipped_out+overflow)
+        logger.info('frame=%s L1 memory_count=%s memory_expired=0 memory_replaced=%s '
+                    'dx_per_frame=%.3f dy_per_frame=%.3f frame_gap=%s returning=%s',
+                    request.frame, kept, int(updated), state.dx*request.original_width,
+                    state.dy*request.original_height, state.motion_frame_gap, 'L0' if command else 'blocked')
+        self._log_outcome(target, matched, request, kept, accepted, removed, reclassified)
+        return FocusDecision(annotations, command, kept, replaced=int(updated),
+                             cleared=clipped_out+int(removed))
 
     def _match_target(self, target, live, state, request, predicted_box=None):
         if target is None:
@@ -668,21 +663,25 @@ class FocusPolicy:
                                        detection.object_id, tuple(detection.bbox), detection))
         return min(candidates, key=lambda item: item[:-1])[-1] if candidates else None
 
-    def _log_outcome(self, target, matched, request, memory_count):
+    def _log_outcome(self, target, matched, request, memory_count, accepted, removed, reclassified):
         previous = target.detection if target is not None else None
         area = ((previous.bbox[2]-previous.bbox[0])*(previous.bbox[3]-previous.bbox[1]) *
                 request.original_width*request.original_height) if previous is not None else None
         logger.info('FOCUS_RESULT frame=%s target_track=%s target=%s L0_class=%s L0_conf=%s '
                     'L0_area_px2=%s L1_class=%s L1_conf=%s matched=%s class_changed=%s '
-                    'confidence_increased=%s memory_count=%s', request.frame,
+                    'confidence_increased=%s memory_count=%s same_class=%s confidence_changed=%s '
+                    'target_removed=%s reclassification_accepted=%s', request.frame,
                     target.track_id if target else 'none', previous.object_id if previous else 'none',
                     previous.object_id if previous else 'none',
                     f'{previous.confidence:.4f}' if previous else 'none',
                     f'{area:.3f}' if area is not None else 'none',
                     matched.object_id if matched else 'none', f'{matched.confidence:.4f}' if matched else 'none',
                     str(matched is not None).lower(),
-                    str(matched is not None and matched.object_id != previous.object_id).lower(),
-                    str(matched is not None and matched.confidence > previous.confidence).lower(), memory_count)
+                    str(reclassified).lower(),
+                    str(accepted is not None and accepted.confidence > previous.confidence).lower(), memory_count,
+                    str(matched is not None and matched.object_id == previous.object_id).lower(),
+                    str(accepted is not None and accepted.confidence != previous.confidence).lower(),
+                    str(removed).lower(), str(reclassified).lower())
 
 
 focus_policy = FocusPolicy()

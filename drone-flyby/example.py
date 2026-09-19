@@ -17,6 +17,9 @@ from dtos import (
 )
 from utils import decode_view
 from detector import get_detector
+from focus_policy import focus_policy
+from capture_data import capture_request, enabled
+from collection_policy import collection_policy
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDto:
     """Answer one frame: report detections and pick the next camera position."""
+    capture_request(request)
     # The evaluator tells you when it ignored your last camera command. Reading
     # this beats wondering why the camera never moved.
     if request.camera_command_feedback is not None:
@@ -34,6 +38,15 @@ def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDt
             feedback.frame,
             feedback.reason,
         )
+
+    if enabled('CAPTURE_ONLY'):
+        return DroneFlybyPredictResponseDto(
+            request_id=request.request_id, frame=request.frame, annotations=[],
+            requested_view=choose_next_view(request))
+
+    is_focus = os.environ.get("CAMERA_POLICY", "hold_full").strip().lower() == "focus_l1"
+    if is_focus:
+        focus_policy.begin_request(request)
 
     image = decode_view(request.view)
 
@@ -45,12 +58,18 @@ def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDt
         logger.exception('Detector failed on frame %s', request.frame)
         annotations = []
 
+    if is_focus:
+        decision = focus_policy.process(request, annotations)
+        annotations, requested_view = decision.annotations, decision.requested_view
+    else:
+        requested_view = choose_next_view(request)
+
     return DroneFlybyPredictResponseDto(
         # These two must come straight back from the request, unchanged.
         request_id=request.request_id,
         frame=request.frame,
         annotations=annotations,
-        requested_view=choose_next_view(request),
+        requested_view=requested_view,
     )
 
 
@@ -71,6 +90,11 @@ _sweep_direction: Dict[str, int] = {}
 
 def choose_next_view(request):
     mode = os.environ.get('CAMERA_POLICY', 'hold_full').strip().lower()
+    if mode == 'data_collect':
+        return collection_policy.choose(request)
+    if mode == 'focus_l1' and enabled('CAPTURE_ONLY'):
+        focus_policy.begin_request(request)
+        return focus_policy.process(request, []).requested_view
     if mode == 'baseline_sweep':
         return baseline_sweep(request)
     if mode != 'hold_full':

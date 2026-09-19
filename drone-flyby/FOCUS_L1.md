@@ -1,128 +1,141 @@
-# Selective L1 confirmation with individual bbox prediction
+# Strict target-only L1 confirmation
 
-`hold_full` remains unchanged and remains the default. `focus_l1` still requires
-three successful L0 observations before an eligible L1 request and returns to L0
-after that one visit. No L2, exploration, API changes, warmup, detector/checkpoint
-changes, training or evaluator changes. Only lightweight unit/static checks were run.
+focus_l1 is target-only. L1 detections cannot add, replace, re-score, reclassify,
+or remove non-target snapshot objects.
 
-## Candidate filtering
+The most recent L0 snapshot is authoritative. L1 inspects only the selected weak
+target, then requests L0 using the supplied camera constraints. There is no L2,
+exploration, sweeping, sequence-length assumption, or special end-frame handling.
+The default hold_full and baseline_sweep behavior remain unchanged.
 
-Only these classes may consume a confirmation frame: `small_launcher`, `ta-ta`,
-`mine_roller`, `hangar`, `medium_launcher`, `medium_plane`.
+## Integration and candidate rules
 
-A candidate must also have confidence <= `FOCUS_MAX_CONF` (default **0.45**), pass
-existing cooldown/confirmation gates and reach `FOCUS_MIN_SCORE` (default **1.2**).
-Thus the reported ta-ta 0.164 and small_launcher 0.351 / 0.104 cases are eligible,
-while spacecraft 0.141 and ta-ta 0.677 are not. Filtering focus candidates never
-removes objects from the L0 response or saved full-frame snapshot.
+predict() calls the singleton's begin_request before detection in focus_l1 mode,
+runs detect exactly once, then calls process with its annotations. A detector
+exception is logged and passed to process as an empty list, so failed L1 still
+bridges the saved snapshot and attempts to return to L0. Other policies never
+invoke the focus policy; invalid focus environment settings cannot affect them.
 
-The request DTO contains no reliable remaining-frame/end-of-sequence field. There
-is no special treatment of frame 24, frame 25, or any assumed sequence length.
-A last-frame focus request can still occur because the policy cannot know it is last.
+By default, only small_launcher, ta-ta, mine_roller, hangar, medium_launcher, and medium_plane
+can trigger inspection. Default gates are confidence <= 0.45, score >= 1.2, and
+at least three L0 frames with detections since startup or the last L1. Empty L0
+observations (including failed detector calls) replace authoritative L0 state but
+do not advance that waiting counter. Source-frame gaps and retries do not add
+extra observations. Existing cooldown and confirmation score penalties still apply.
 
-## Snapshot bridge: preserved with per-object prediction
+`FOCUS_CLASSES` overrides the focus-class allowlist with comma-separated names;
+whitespace is stripped and empty entries ignored. Unknown names simply do not
+match detections. Unset preserves the six classes above; an explicitly empty
+allowlist disables focus candidates. `FOCUS_MIN_CONF` defaults to **0.0**.
+Confidence eligibility is inclusive: `FOCUS_MIN_CONF <= confidence <= FOCUS_MAX_CONF`.
+Both bounds must be in [0, 1], with minimum <= maximum. Defaults preserve previous
+behavior, including sub-0.15 persistence protection. L0 logs include both bounds
+and the active allowlist. Restart the API after changing these settings.
 
-Before issuing L1, the policy deep-copies all current L0 annotations, the source
-frame, target index and an aligned optional four-edge velocity per annotation.
-Snapshot output remains independent of tracker identity, TTL and confidence decay.
+For the ta-ta-only 0.35–0.45 experiment:
 
-For each current L0 object, matching to the previous L0 observation requires the
-same class, IoU and center distance. Reliability is conservative: compare against
-the globally shifted previous box, require IoU >= 0.2, center distance within the
-existing frame-gap gate, width/height ratios within [0.5, 2], and reciprocal best
-matches separated from runners-up by 0.1 cost. Ambiguous matches use fallback.
+```powershell
+$env:FOCUS_CLASSES = 'ta-ta'
+$env:FOCUS_MIN_CONF = '0.35'
+$env:FOCUS_MAX_CONF = '0.45'
+```
 
-For a reliable match, each edge velocity is computed from the ORIGINAL previous
-box: `(current_edge - previous_edge) / (current_frame - previous_frame)`.
-For the immediate next source frame, each saved edge receives exactly its own
-velocity once. Width and height can therefore change, and one object's motion can
-differ from the scene translation. Nonpositive predicted sizes reject the velocity.
+Confidence < 0.15 additionally requires a reliable geometric same-class match in
+the immediately previous authoritative L0 observation. It uses the existing
+individual-velocity correspondence: globally shifted previous box, actual frame
+gap, IoU >= 0.2, the existing center-distance gate, size ratios in [0.5, 2], and
+reciprocal best matches with a 0.1 cost margin. Invalid next-frame size rejects the
+correspondence. L1 cannot supply evidence. Confidence exactly 0.15 follows normal
+candidate rules. An empty intervening L0 prevents using an older observation.
 
-Unmatched/ambiguous objects use the existing median global per-source-frame dx/dy.
-Individual velocity is never extrapolated over multiple source frames. If the next
-received frame skips source frames, the prior global translation fallback is used
-with the actual gap. The frame gap and counts are logged. All outputs are clipped
-and snapshot confidence remains unchanged.
+## Snapshot and geometry
 
-## Conservative L1 merge
+When requesting L1, deep-copy the full L0 annotation list (up to the protocol cap
+of 500), source frame, target index, and optional per-object four-edge velocities.
+Reliable edge velocities use (current edge - previous edge) / source-frame gap.
 
-The existing snapshot bridge is retained; only its association criteria change:
+For the immediately next source frame, use each reliable individual velocity,
+including size changes. Otherwise use the existing median global motion fallback.
+If source frames are skipped, use global dx/dy times the actual gap for every
+object; never extrapolate individual velocities across that gap. Clip boxes to
+the frame and omit degenerate/out-of-frame projections. Preserve saved confidence.
 
-- The focused target's matching live box always wins, including a class correction.
-  Its geometric match uses the individually predicted target box when available.
-- An incidental object replaces a saved object only with the same class, IoU >= 0.65,
-  center distance <= 0.25 of the smaller box diagonal, and unambiguous reciprocal
-  matching. The matching margin is 0.1 in `1-IoU` cost.
-- A weak/ambiguous incidental live box near a saved object is not added as a duplicate;
-  the propagated saved box remains. Novelty checks are class-agnostic and conservative
-  (IoU >= 0.1 or close centers means possibly the same object).
-- A live detection may be added as new only if it is not a possible duplicate of a
-  saved object or an already accepted live object.
-- All unmatched saved objects, including objects inside the view, remain. Outside-view
-  saved objects are not replaced. A live replacement can claim at most one saved box.
-- There is still no NMS among saved objects. Only clipping to an empty/degenerate box
-  or the 500-output protocol cap can remove an unmatched saved object; both are logged.
+The projected snapshot supplies every L1 output box. Tracker TTL, confidence
+decay, live duplicate suppression, and incidental detections cannot remove it.
 
-A repeated identical request returns its cached response. The snapshot is consumed
-once, discarded on the next fresh L0, and never contaminates that authoritative L0
-output. Unexpected extra L1 frames log a consumed/missing snapshot and request L0.
+## Target-only outcome
 
-## Configuration
+Associate L1 detections with the predicted target box using the existing
+deterministic IoU/distance ranking. Both boxes must intersect the received crop.
+Reject a live candidate that matches another projected snapshot object's location
+at least as well in overlap or center distance.
 
-Settings are read once on first focus use; restart the API after changing them.
+- Same-class match: use L1 confidence, always retaining the projected L0 bbox.
+- Different-class match: change class and confidence only at confidence >=
+  FOCUS_CONFIRM_CONF (default 0.70) and a strong spatial match. Reuse the existing
+  strong thresholds: IoU >= 0.65 and center distance <= 0.25 of the smaller
+  diagonal. Always retain the projected L0 bbox.
+- A weak class correction retains the original projected target unchanged.
+- No spatial match: remove only the target if its saved confidence <= 0.15;
+  otherwise retain it unchanged. This includes a failed L1 detection call.
 
-| Variable | Default | Purpose |
-|---|---:|---|
-| `FOCUS_MIN_L0_FRAMES` | 3 | Successful L0 frames before zoom |
-| `FOCUS_MAX_CONF` | 0.45 | Maximum candidate confidence (inclusive) |
-| `FOCUS_MIN_SCORE` | 1.2 | Minimum candidate score |
-| `FOCUS_CONFIRMED_FRAMES` | 12 | Source-frame confirmation lifetime |
-| `FOCUS_CONFIRM_CONF` | 0.70 | Same-class L1 confidence needed to confirm |
-| `FOCUS_CONFIRMED_PENALTY` | 10 | Score penalty near a confirmed object |
+Updates occupy the target's original position in the output; unrelated objects
+retain their order, class, confidence, and predicted geometry. New L1 objects are
+never emitted, even when the snapshot is already at the 500-object cap.
 
-The class/position confirmation record is independent of track ID. L0 matching
-updates its predicted position without refreshing its L1 confirmation date.
-Scoring weights and geometric match thresholds are in `FocusConfig`. Legacy tracker
-TTL/decay settings still never apply to snapshot confidence or preservation.
+Same-class accepted confidence >= 0.70 creates the existing confirmation record
+at the emitted projected geometry. A correction creates no old-class confirmation.
+Confirmation lifetime, trajectory following, and four-L0-refresh cooldown remain.
+Configuration is loaded lazily on first focus use; restart after changing it.
+
+| Variable | Default |
+|---|---:|
+| FOCUS_MIN_L0_FRAMES | 3 |
+| FOCUS_CLASSES | The six classes listed above |
+| FOCUS_MIN_CONF | 0.0 |
+| FOCUS_MAX_CONF | 0.45 |
+| FOCUS_MIN_SCORE | 1.2 |
+| FOCUS_CONFIRMED_FRAMES | 12 |
+| FOCUS_CONFIRM_CONF | 0.70 |
+| FOCUS_CONFIRMED_PENALTY | 10 |
+
+An identical retry returns the cached decision without advancing policy state.
+A snapshot is consumed once and discarded on fresh L0. Extra L1 frames with a
+consumed/missing snapshot return no annotations and attempt L0. Sequence changes
+and non-retry source-frame rewinds reset state.
 
 ## Diagnostics
 
-`FOCUS_BRIDGE` retains count accounting:
+FOCUS_BRIDGE reports frame, snapshot_count, snapshot_kept, target_updated,
+target_removed, final_count, snapshot_clipped_out, source_frame_gap,
+snapshot_status, individual_velocity, and global_fallback. snapshot_kept counts
+unchanged projected objects; target_updated counts accepted target matches.
+Legacy snapshot_replaced equals target_updated; live_added and snapshot_overflow
+are always zero. live_count is the number of input L1 detections.
 
 ```
-snapshot_count = snapshot_kept + snapshot_replaced + snapshot_clipped_out + snapshot_overflow
-final_count = live_count + snapshot_kept
+snapshot_count = snapshot_kept + target_updated + target_removed + snapshot_clipped_out
+final_count = snapshot_kept + target_updated
+individual_velocity + global_fallback = snapshot_count - snapshot_clipped_out
 ```
 
-`live_count` now counts ACCEPTED live boxes. `live_candidates` counts live boxes
-after live-only deduplication; `live_rejected` counts rejected ambiguous/duplicate
-incidental candidates. `live_duplicates` counts live-only deduplication losses.
-
-Each L1 frame additionally logs compact JSON class counts:
-
-```
-FOCUS_BRIDGE_CLASSES frame=... propagated={...} live_replaced={...} live_added={...}
- individual_velocity=... global_fallback=...
-```
-
-The three class maps describe FINAL output sources. Replacement classes refer to
-the emitted live label (including a target class correction). Their counts sum to
-`final_count`. The velocity counters describe all valid predicted snapshot boxes
-BEFORE replacement or the output cap, so they sum to `snapshot_count - snapshot_clipped_out`.
-
-`FOCUS_RESULT` remains. L0 logs class/confidence filter counts and skip reasons.
-No raw bbox arrays or tensors are logged.
+FOCUS_RESULT reports L0 class/confidence/area, spatial matched status, L1
+class/confidence, same_class, accepted class_changed/confidence_changed,
+target_removed, and reclassification_accepted. A spatially matched but rejected
+class correction reports matched=true with no accepted changes. No raw tensors
+or large box arrays are logged.
 
 ## Evidence and limitations
 
-User-supplied previous offline results: hold_full **0.693**, snapshot focus_l1
-**0.669**. Detection counts were preserved, but jet_plane, large_tower and small_plane
-lost AP. The new selective/individual-motion version is **unmeasured**. Confidence
-gains and passing unit tests do not establish an mAP improvement.
+Historical user-supplied offline results: hold_full baseline **0.693**; older
+snapshot focus experiment **0.669**, which was worse. This strict target-only
+version is **unmeasured** until the user runs the evaluator. Passing unit tests
+does not imply mAP improvement.
 
-Conservative matching can miss new objects close to existing ones; ambiguous motion
-falls back to global translation. This remains an existing-detection confirmation
-experiment, not exploration or long-term tracking.
+Conservative correspondence can reject real weak targets or class corrections.
+Global fallback can miss individual motion. A detector failure can remove an
+unmatched <=0.15 target by design. These tradeoffs need the offline comparison.
+No training, inference sweep, API benchmark, or evaluator was run for this change.
 
 ## Next offline comparison: USER executes
 
@@ -133,7 +146,7 @@ In server terminal A:
 
 ```powershell
 conda activate drone-yolo
-New-Item -ItemType Directory -Force benchmarks/logs/selective_focus | Out-Null
+New-Item -ItemType Directory -Force benchmarks/logs/target_only_focus | Out-Null
 $env:YOLO_WEIGHTS = (Resolve-Path 'runs/detect/helsinki_yolov8n_multires_rot/weights/best.pt').Path
 $env:YOLO_CONF = '0.05'
 $env:YOLO_IOU = '0.5'
@@ -149,35 +162,32 @@ $env:FOCUS_CONFIRM_CONF = '0.70'
 $env:FOCUS_CONFIRMED_PENALTY = '10'
 Get-FileHash $env:YOLO_WEIGHTS -Algorithm SHA256
 $env:CAMERA_POLICY = 'hold_full'
-python api.py 2>&1 | Tee-Object benchmarks/logs/selective_focus/hold_server.log
+python api.py 2>&1 | Tee-Object benchmarks/logs/target_only_focus/hold_server.log
 ```
 
 Wait for startup, then run in evaluator terminal B:
 
 ```powershell
 conda activate drone-yolo
-python local_evaluator.py 2>&1 | Tee-Object benchmarks/logs/selective_focus/hold_eval.log
+python local_evaluator.py 2>&1 | Tee-Object benchmarks/logs/target_only_focus/hold_eval.log
 ```
 
 Stop the API in terminal A with Ctrl+C and restart it there:
 
 ```powershell
 $env:CAMERA_POLICY = 'focus_l1'
-python api.py 2>&1 | Tee-Object benchmarks/logs/selective_focus/focus_server.log
+python api.py 2>&1 | Tee-Object benchmarks/logs/target_only_focus/focus_server.log
 ```
 
 Then run in terminal B:
 
 ```powershell
-python local_evaluator.py 2>&1 | Tee-Object benchmarks/logs/selective_focus/focus_eval.log
+python local_evaluator.py 2>&1 | Tee-Object benchmarks/logs/target_only_focus/focus_eval.log
 ```
 
-Return all four logs plus checkpoint SHA256. We need both overall/per-class AP
-summaries, accepted/skipped frames, camera moves/refusals, every `FOCUS_BRIDGE`, `FOCUS_BRIDGE_CLASSES` and
-`FOCUS_RESULT`, and focus counts. In particular compare jet_plane, large_tower and small_plane for recovery and
-small_launcher/ta-ta for preserved gains. Include individual/global prediction counts
-and the per-class propagated/replaced/added counts.
-Do not infer improvement from confidence increases alone.
+Keep all four logs and the checkpoint SHA256. Compare overall/per-class AP,
+accepted/skipped frames, camera moves/refusals, focus counts, and FOCUS_BRIDGE /
+FOCUS_RESULT diagnostics. Confidence increases alone do not establish improvement.
 
 Lightweight checks only:
 
