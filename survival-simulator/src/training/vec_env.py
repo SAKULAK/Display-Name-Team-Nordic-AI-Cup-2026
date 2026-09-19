@@ -27,8 +27,8 @@ def _worker(remote, worker_env_remote):
         elif cmd == "reset":
             remote.send(env.reset())
         elif cmd == "set_difficulty":
-            fruit_mult, tree_mult = data
-            env.set_difficulty(fruit_mult, tree_mult)
+            fruit_mult, tree_mult, predator_speed_mult = data
+            env.set_difficulty(fruit_mult, tree_mult, predator_speed_mult)
             remote.send(None)
         elif cmd == "close":
             remote.close()
@@ -76,9 +76,9 @@ class SubprocVecSurvivalEnv:
             remote.send(("step", actions))
         return [remote.recv() for remote in self._remotes]
 
-    def set_difficulty(self, fruit_mult: float, tree_mult: float):
+    def set_difficulty(self, fruit_mult: float, tree_mult: float, predator_speed_mult: float = 1.0):
         for remote in self._remotes:
-            remote.send(("set_difficulty", (fruit_mult, tree_mult)))
+            remote.send(("set_difficulty", (fruit_mult, tree_mult, predator_speed_mult)))
         for remote in self._remotes:
             remote.recv()
 

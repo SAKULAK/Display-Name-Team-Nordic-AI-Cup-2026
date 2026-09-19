@@ -58,6 +58,13 @@ CURRICULUM_UPDATES = 400
 CURRICULUM_FRUIT_MULT_START = 1.5
 CURRICULUM_TREE_MULT_START = 1.3
 
+# Predators start at reduced speed (still present, still learnable-around) and ramp
+# to full speed over the same curriculum window - a predator agents can usually
+# outrun early on still teaches them to notice and react to it (including the new
+# orientation-based PREDATOR_FACE_COEF signal), whereas starting_predators=0 would
+# mean no predator-related signal at all until curriculum ends.
+CURRICULUM_PREDATOR_SPEED_MULT_START = 0.5
+
 CHECKPOINT_PATH = "checkpoints/policy.pt"
 # Lower than before given the much larger N_ENVS: train.py has no SIGTERM handler, so
 # a SLURM walltime kill only preserves progress up to the last checkpoint boundary -
@@ -316,7 +323,11 @@ def train():
             curriculum_progress = min(1.0, update / CURRICULUM_UPDATES)
             fruit_mult = CURRICULUM_FRUIT_MULT_START + (1.0 - CURRICULUM_FRUIT_MULT_START) * curriculum_progress
             tree_mult = CURRICULUM_TREE_MULT_START + (1.0 - CURRICULUM_TREE_MULT_START) * curriculum_progress
-            vec_env.set_difficulty(fruit_mult, tree_mult)
+            predator_speed_mult = (
+                CURRICULUM_PREDATOR_SPEED_MULT_START
+                + (1.0 - CURRICULUM_PREDATOR_SPEED_MULT_START) * curriculum_progress
+            )
+            vec_env.set_difficulty(fruit_mult, tree_mult, predator_speed_mult)
 
             entropy_progress = min(1.0, update / ENTROPY_ANNEAL_UPDATES)
             entropy_coef = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * entropy_progress
@@ -351,7 +362,8 @@ def train():
                 f"update {update:5d} | avg score {mean_score:7.2f} | avg agents {mean_agents:4.1f} | "
                 f"avg sim_time {mean_sim_time:7.1f}s | transitions {n_transitions:5d} | "
                 f"mean_reward {mean_reward:+.4f} | entropy_coef {entropy_coef:.4f} | "
-                f"fruit_mult {fruit_mult:.2f} | {time.time() - start_time:.1f}s"
+                f"fruit_mult {fruit_mult:.2f} | predator_speed_mult {predator_speed_mult:.2f} | "
+                f"{time.time() - start_time:.1f}s"
             )
 
             if update % CHECKPOINT_EVERY == 0:
