@@ -26,7 +26,7 @@ from src.training.vec_env import SubprocVecSurvivalEnv
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-N_ENVS = 60                # parallel SurvivalEnv instances collected into each rollout
+N_ENVS = 100                # parallel SurvivalEnv instances collected into each rollout
 TOTAL_UPDATES = 10000      # number of PPO update iterations (training is fully resumable via checkpoints, so this is just a cap)
 ROLLOUT_TICKS = 256        # env ticks collected per rollout, per env (x N_ENVS transitions/update)
 GAMMA = 0.99
@@ -41,7 +41,12 @@ ENTROPY_COEF_END = 0.005
 ENTROPY_ANNEAL_UPDATES = 500
 LEARNING_RATE = 3e-4
 UPDATE_EPOCHS = 4
-MINIBATCH_SIZE = 256
+# Scales with N_ENVS: total transitions per update is roughly N_ENVS * ROLLOUT_TICKS,
+# so a minibatch size tuned for a small N_ENVS means way too many tiny minibatches
+# per epoch at a large one (mostly Python-loop/GPU-launch overhead for a network this
+# small, not actual compute). Keeping this roughly proportional to N_ENVS keeps
+# minibatches-per-epoch in the same ballpark instead of exploding with it.
+MINIBATCH_SIZE = 4096
 MAX_GRAD_NORM = 0.5
 
 # Curriculum: start with extra fruit/tree density so food is easy to find while the
@@ -53,8 +58,19 @@ CURRICULUM_UPDATES = 400
 CURRICULUM_FRUIT_MULT_START = 1.5
 CURRICULUM_TREE_MULT_START = 1.3
 
+# Predators start at reduced speed (still present, still learnable-around) and ramp
+# to full speed over the same curriculum window - a predator agents can usually
+# outrun early on still teaches them to notice and react to it (including the new
+# orientation-based PREDATOR_FACE_COEF signal), whereas starting_predators=0 would
+# mean no predator-related signal at all until curriculum ends.
+CURRICULUM_PREDATOR_SPEED_MULT_START = 0.5
+
 CHECKPOINT_PATH = "checkpoints/policy.pt"
-CHECKPOINT_EVERY = 20
+# Lower than before given the much larger N_ENVS: train.py has no SIGTERM handler, so
+# a SLURM walltime kill only preserves progress up to the last checkpoint boundary -
+# with far more data per update now, losing up to CHECKPOINT_EVERY updates' worth is
+# a bigger deal in wall-clock terms than it was at a small N_ENVS.
+CHECKPOINT_EVERY = 5
 
 
 @dataclass
@@ -307,7 +323,11 @@ def train():
             curriculum_progress = min(1.0, update / CURRICULUM_UPDATES)
             fruit_mult = CURRICULUM_FRUIT_MULT_START + (1.0 - CURRICULUM_FRUIT_MULT_START) * curriculum_progress
             tree_mult = CURRICULUM_TREE_MULT_START + (1.0 - CURRICULUM_TREE_MULT_START) * curriculum_progress
-            vec_env.set_difficulty(fruit_mult, tree_mult)
+            predator_speed_mult = (
+                CURRICULUM_PREDATOR_SPEED_MULT_START
+                + (1.0 - CURRICULUM_PREDATOR_SPEED_MULT_START) * curriculum_progress
+            )
+            vec_env.set_difficulty(fruit_mult, tree_mult, predator_speed_mult)
 
             entropy_progress = min(1.0, update / ENTROPY_ANNEAL_UPDATES)
             entropy_coef = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * entropy_progress
@@ -342,7 +362,8 @@ def train():
                 f"update {update:5d} | avg score {mean_score:7.2f} | avg agents {mean_agents:4.1f} | "
                 f"avg sim_time {mean_sim_time:7.1f}s | transitions {n_transitions:5d} | "
                 f"mean_reward {mean_reward:+.4f} | entropy_coef {entropy_coef:.4f} | "
-                f"fruit_mult {fruit_mult:.2f} | {time.time() - start_time:.1f}s"
+                f"fruit_mult {fruit_mult:.2f} | predator_speed_mult {predator_speed_mult:.2f} | "
+                f"{time.time() - start_time:.1f}s"
             )
 
             if update % CHECKPOINT_EVERY == 0:

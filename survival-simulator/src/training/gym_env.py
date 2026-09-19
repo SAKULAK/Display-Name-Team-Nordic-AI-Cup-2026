@@ -110,6 +110,53 @@ SPAWN_REWARD = 2.0
 # parent one bad tick from starving isn't rewarded as generously as a safe one.
 SPAWN_SAFETY_MARGIN = 50.0
 
+# Reward for how aligned this tick's actual displacement is with the previous tick's,
+# scaled by how far it moved this tick. Sustained, committed movement in roughly one
+# direction scores high; a random walk's consecutive directions are independent by
+# construction, so cos_similarity averages to 0 over many ticks - structurally safer
+# than SEARCH_COEF's cumulative EMA-gap approach, which is what let a too-large
+# SEARCH_COEF get farmed by pure diffusion (see its own comment). This doesn't reward
+# accumulated drift at all, only genuine tick-to-tick directional consistency, so
+# there's no equivalent drift to over-reward in the first place. Complements
+# SEARCH_COEF (a slower, memory-based "have I actually gotten anywhere over time"
+# signal) with an immediate "am I currently committing to a direction, not
+# dithering" one - also directly discourages the jittery oscillation/hesitation
+# pattern reported during training, since reversing direction tick-to-tick scores
+# negative (cos_similarity < 0), not just neutral.
+MOMENTUM_COEF = 0.5
+
+# Distance within which Predator.step() charges the closest agent directly
+# regardless of whether that agent is facing it (mirrors hearing_radius=60 * 1.5 from
+# predator.py exactly - see PREDATOR_FACE_COEF below). Facing only changes predator
+# behavior beyond this range, so it's the threshold for PREDATOR_FACE_COEF's own gate.
+PREDATOR_CHARGE_RANGE = 90.0
+
+# Potential-based: reward reducing the angle to a still-distant known predator (i.e.
+# turning to face it), penalize increasing it. Zero once the predator is within
+# PREDATOR_CHARGE_RANGE, where it no longer matters (see below) - this is deliberately
+# NOT a general "always face predators" reward, since that would fight
+# PREDATOR_AVOID_COEF's flee incentive once a predator is actually closing in.
+#
+# This exploits a real branch in Predator.step()'s own scripted AI (predator.py):
+# it only charges the closest agent directly when that agent isn't facing it (or
+# it's already within PREDATOR_CHARGE_RANGE); otherwise it does a slower, more
+# cautious flanking maneuver instead. The angle that decision is based on
+# (`agent_looking_dir`, computed by the predator from the agent's own .direction) is
+# mathematically identical to the angle the agent itself already observes toward that
+# predator (its own `angle` field in the Predator observation slot) - both reduce to
+# arctan2(predator.y - agent.y, predator.x - agent.x) - agent.direction, just computed
+# from opposite sides of the same relationship. So the agent already has direct access
+# to the exact quantity that decides the predator's behavior; this reward just makes
+# using it worth learning.
+#
+# Telescoping potential shaping like FRUIT_APPROACH_COEF, so it's immune to
+# path-based farming: oscillating the facing angle back and forth nets to zero over
+# any full cycle (sum of per-tick deltas = final |angle| - initial |angle|,
+# regardless of path), so only genuinely bringing a predator into view and holding it
+# there accumulates reward - the same guarantee that makes fruit_approach_reward safe
+# against distance oscillation.
+PREDATOR_FACE_COEF = 0.5
+
 
 def _bucket(entries, k: int, sort_key, feature_fn, n_features: int) -> np.ndarray:
     entries_sorted = sorted(entries, key=sort_key)[:k]
@@ -162,6 +209,15 @@ def _nearest_predator_distance(status: dict):
     return min(predator_distances) if predator_distances else None
 
 
+def _nearest_predator_angle(status: dict):
+    """Angle (relative to own facing) to the closest currently seen/heard predator, by
+    the same nearest-by-distance predator _nearest_predator_distance tracks, or None."""
+    predators = [o for o in status["observations"] if o["type"] == "Predator"]
+    if not predators:
+        return None
+    return min(predators, key=lambda o: o["distance"])["angle"]
+
+
 # Reward formulas (pure, unit-testable) 
 
 def fruit_approach_reward(prev_dist, curr_dist) -> float:
@@ -189,6 +245,32 @@ def search_reward_and_ref(curr_pos: Tuple[float, float], ref_pos: Tuple[float, f
         ref_pos[1] + SEARCH_EMA_ALPHA * (curr_pos[1] - ref_pos[1]),
     )
     return reward, new_ref
+
+
+def momentum_reward(prev_disp, curr_disp) -> float:
+    """See MOMENTUM_COEF. Cosine similarity between this tick's and last tick's
+    displacement vectors, scaled by how far this tick actually moved. 0.0 if either
+    tick had ~no movement (alignment is undefined for a near-zero vector, and
+    shouldn't be rewarded or punished either way)."""
+    if prev_disp is None or curr_disp is None:
+        return 0.0
+    prev_mag = float(np.hypot(prev_disp[0], prev_disp[1]))
+    curr_mag = float(np.hypot(curr_disp[0], curr_disp[1]))
+    if prev_mag < 1e-6 or curr_mag < 1e-6:
+        return 0.0
+    cos_similarity = (prev_disp[0] * curr_disp[0] + prev_disp[1] * curr_disp[1]) / (prev_mag * curr_mag)
+    return MOMENTUM_COEF * cos_similarity * (curr_mag / NORM_DIST)
+
+
+def predator_face_reward(prev_angle, curr_angle, curr_distance) -> float:
+    """See PREDATOR_FACE_COEF. Potential-based on |angle| to the nearest known
+    predator, gated off once that predator is within PREDATOR_CHARGE_RANGE (where
+    facing no longer affects its behavior) or not tracked on both sides of the tick."""
+    if prev_angle is None or curr_angle is None or curr_distance is None:
+        return 0.0
+    if curr_distance <= PREDATOR_CHARGE_RANGE:
+        return 0.0
+    return PREDATOR_FACE_COEF * (abs(prev_angle) - abs(curr_angle)) / np.pi
 
 
 def spawn_reward(pre_spawn_energy: float) -> float:
@@ -310,17 +392,32 @@ class SurvivalEnv(gym.Env):
         self._prev_fruit_dist: Dict[int, float] = {}
         self._prev_predator_dist: Dict[int, float] = {}
         self._search_ref_pos: Dict[int, Tuple[float, float]] = {}
+        self._prev_position: Dict[int, Tuple[float, float]] = {}
+        self._prev_displacement: Dict[int, Tuple[float, float]] = {}
+        self._prev_predator_angle: Dict[int, float] = {}
+        self._predator_speed_mult = 1.0
 
-    def set_difficulty(self, fruit_mult: float = 1.0, tree_mult: float = 1.0):
+    def set_difficulty(self, fruit_mult: float = 1.0, tree_mult: float = 1.0, predator_speed_mult: float = 1.0):
         """
-        Scale starting fruit/tree counts relative to the env's base config - used for
-        a simple curriculum (denser food early, annealed down to the real difficulty).`"""
+        Scale starting fruit/tree counts relative to the env's base config, and
+        predator speed/sprint_speed by predator_speed_mult (applied on top of each
+        predator's own already-mutated speed, at reset() time) - used for a simple
+        curriculum (easier early, annealed up to full difficulty). Predator count
+        itself is left alone (starting_predators): a present-but-slow predator still
+        lets agents learn to notice and react to it from the start, which an
+        absent-then-suddenly-real predator wouldn't."""
         self._sim_kwargs["starting_fruits"] = max(1, int(self._base_starting_fruits * fruit_mult))
         self._sim_kwargs["starting_trees"] = max(1, int(self._base_starting_trees * tree_mult))
+        self._predator_speed_mult = float(np.clip(predator_speed_mult, 0.0, 1.0))
 
     def reset(self, *, seed: int = None, options: dict = None):
         actual_seed = seed if seed is not None else self._seed
         self.sim = SimulationCore(seed=actual_seed, **self._sim_kwargs)
+
+        if self._predator_speed_mult != 1.0:
+            for predator in self.sim.env.predators:
+                predator.speed *= self._predator_speed_mult
+                predator.sprint_speed *= self._predator_speed_mult
 
         self._last_status = {
             agent.agent_id: self.sim.env.get_agent_state(agent.agent_id)
@@ -331,7 +428,12 @@ class SurvivalEnv(gym.Env):
         self._prev_predator_dist = {
             aid: _nearest_predator_distance(status) for aid, status in self._last_status.items()
         }
+        self._prev_predator_angle = {
+            aid: _nearest_predator_angle(status) for aid, status in self._last_status.items()
+        }
         self._search_ref_pos = {agent.agent_id: (agent.x, agent.y) for agent in self.sim.env.agents}
+        self._prev_position = {agent.agent_id: (agent.x, agent.y) for agent in self.sim.env.agents}
+        self._prev_displacement = {agent.agent_id: (0.0, 0.0) for agent in self.sim.env.agents}
 
         sim_time_frac = min(self.sim.env.time / self.max_time, 1.0)
         obs = {aid: encode_observation(status, sim_time_frac) for aid, status in self._last_status.items()}
@@ -361,7 +463,10 @@ class SurvivalEnv(gym.Env):
         prev_energy = self._prev_energy
         prev_fruit_dist = self._prev_fruit_dist
         prev_predator_dist = self._prev_predator_dist
+        prev_predator_angle = self._prev_predator_angle
         prev_search_ref = self._search_ref_pos
+        prev_position = self._prev_position
+        prev_displacement = self._prev_displacement
 
         state = self.sim.step(action_requests)
 
@@ -373,6 +478,8 @@ class SurvivalEnv(gym.Env):
 
         obs, rewards, terminated, truncated, infos = {}, {}, {}, {}, {}
         updated_search_ref: Dict[int, Tuple[float, float]] = {}
+        updated_position: Dict[int, Tuple[float, float]] = {}
+        updated_displacement: Dict[int, Tuple[float, float]] = {}
 
         for agent_id in alive_ids:
             status = alive_status[agent_id]
@@ -386,6 +493,10 @@ class SurvivalEnv(gym.Env):
             curr_pred_dist = _nearest_predator_distance(status)
             pred_reward = predator_avoid_reward(prev_pred_dist, curr_pred_dist)
 
+            prev_pred_angle = prev_predator_angle.get(agent_id)
+            curr_pred_angle = _nearest_predator_angle(status)
+            face_reward = predator_face_reward(prev_pred_angle, curr_pred_angle, curr_pred_dist)
+
             agent_obj = self.sim.env.agents_dict.get(agent_id)
             curr_pos = (agent_obj.x, agent_obj.y) if agent_obj is not None else None
             ref_pos = prev_search_ref.get(agent_id, curr_pos)
@@ -394,6 +505,15 @@ class SurvivalEnv(gym.Env):
             else:
                 explore_reward = 0.0
 
+            if curr_pos is not None:
+                prev_pos = prev_position.get(agent_id, curr_pos)
+                curr_disp = (curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1])
+                move_reward = momentum_reward(prev_displacement.get(agent_id), curr_disp)
+                updated_position[agent_id] = curr_pos
+                updated_displacement[agent_id] = curr_disp
+            else:
+                move_reward = 0.0
+
             agent_spawn_reward = spawn_reward_for.get(agent_id, 0.0)
 
             rewards[agent_id] = (
@@ -401,6 +521,8 @@ class SurvivalEnv(gym.Env):
                 + fruit_reward
                 + explore_reward
                 + pred_reward
+                + face_reward
+                + move_reward
                 + agent_spawn_reward
             )
             obs[agent_id] = encode_observation(status, sim_time_frac)
@@ -422,7 +544,10 @@ class SurvivalEnv(gym.Env):
         self._prev_energy = {aid: s["energy"] for aid, s in alive_status.items()}
         self._prev_fruit_dist = {aid: _nearest_fruit_distance(s) for aid, s in alive_status.items()}
         self._prev_predator_dist = {aid: _nearest_predator_distance(s) for aid, s in alive_status.items()}
+        self._prev_predator_angle = {aid: _nearest_predator_angle(s) for aid, s in alive_status.items()}
         self._search_ref_pos = updated_search_ref
+        self._prev_position = updated_position
+        self._prev_displacement = updated_displacement
 
         terminated["__all__"] = state["num_agents"] == 0
         truncated["__all__"] = time_up

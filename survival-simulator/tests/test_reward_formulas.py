@@ -1,9 +1,12 @@
 """
 Pure, fast unit tests for the reward formulas in gym_env.py - no SimulationCore
 needed, since fruit_approach_reward/predator_avoid_reward/spawn_reward/
-search_reward_and_ref are all pure functions of their inputs.
+search_reward_and_ref/momentum_reward/predator_face_reward are all pure functions
+of their inputs.
 """
 import unittest
+
+import numpy as np
 
 from src.training import gym_env
 
@@ -143,6 +146,92 @@ class SearchRewardAndRefTests(unittest.TestCase):
         actual_gap = pos - ref[0]
         expected_gap = step * (1 - gym_env.SEARCH_EMA_ALPHA) / gym_env.SEARCH_EMA_ALPHA
         self.assertAlmostEqual(actual_gap, expected_gap, delta=expected_gap * 0.01)
+
+
+class MomentumRewardTests(unittest.TestCase):
+    def test_none_gives_zero(self):
+        self.assertEqual(gym_env.momentum_reward(None, (1.0, 0.0)), 0.0)
+        self.assertEqual(gym_env.momentum_reward((1.0, 0.0), None), 0.0)
+
+    def test_zero_prev_displacement_gives_zero(self):
+        self.assertEqual(gym_env.momentum_reward((0.0, 0.0), (1.0, 0.0)), 0.0)
+
+    def test_zero_curr_displacement_gives_zero(self):
+        self.assertEqual(gym_env.momentum_reward((1.0, 0.0), (0.0, 0.0)), 0.0)
+
+    def test_same_direction_is_positive(self):
+        self.assertGreater(gym_env.momentum_reward((5.0, 0.0), (5.0, 0.0)), 0.0)
+
+    def test_opposite_direction_is_negative(self):
+        self.assertLess(gym_env.momentum_reward((5.0, 0.0), (-5.0, 0.0)), 0.0)
+
+    def test_perpendicular_direction_is_zero(self):
+        self.assertAlmostEqual(gym_env.momentum_reward((5.0, 0.0), (0.0, 5.0)), 0.0, places=6)
+
+    def test_scales_with_current_tick_magnitude(self):
+        small = gym_env.momentum_reward((5.0, 0.0), (1.0, 0.0))
+        large = gym_env.momentum_reward((5.0, 0.0), (10.0, 0.0))
+        self.assertGreater(large, small)
+
+    def test_invariant_to_shared_rotation(self):
+        # Alignment is about the angle BETWEEN the two vectors, not their absolute
+        # heading - rotating both by the same amount shouldn't change the reward.
+        base = gym_env.momentum_reward((5.0, 0.0), (5.0, 2.0))
+        theta = 1.3
+        rot = lambda v: (v[0] * np.cos(theta) - v[1] * np.sin(theta), v[0] * np.sin(theta) + v[1] * np.cos(theta))
+        rotated = gym_env.momentum_reward(rot((5.0, 0.0)), rot((5.0, 2.0)))
+        self.assertAlmostEqual(base, rotated, places=6)
+
+
+class PredatorFaceRewardTests(unittest.TestCase):
+    def test_none_gives_zero(self):
+        self.assertEqual(gym_env.predator_face_reward(None, 0.5, 200.0), 0.0)
+        self.assertEqual(gym_env.predator_face_reward(0.5, None, 200.0), 0.0)
+        self.assertEqual(gym_env.predator_face_reward(0.5, 0.3, None), 0.0)
+
+    def test_within_charge_range_gives_zero_even_if_facing_improved(self):
+        reward = gym_env.predator_face_reward(1.0, 0.1, gym_env.PREDATOR_CHARGE_RANGE - 1.0)
+        self.assertEqual(reward, 0.0)
+
+    def test_at_charge_range_boundary_gives_zero(self):
+        reward = gym_env.predator_face_reward(1.0, 0.1, gym_env.PREDATOR_CHARGE_RANGE)
+        self.assertEqual(reward, 0.0)
+
+    def test_turning_toward_predator_beyond_range_is_positive(self):
+        reward = gym_env.predator_face_reward(1.0, 0.2, gym_env.PREDATOR_CHARGE_RANGE + 1.0)
+        self.assertGreater(reward, 0.0)
+
+    def test_turning_away_from_predator_beyond_range_is_negative(self):
+        reward = gym_env.predator_face_reward(0.2, 1.0, gym_env.PREDATOR_CHARGE_RANGE + 1.0)
+        self.assertLess(reward, 0.0)
+
+    def test_magnitude_matches_formula(self):
+        prev_angle, curr_angle, dist = 1.0, 0.2, 150.0
+        reward = gym_env.predator_face_reward(prev_angle, curr_angle, dist)
+        expected = gym_env.PREDATOR_FACE_COEF * (abs(prev_angle) - abs(curr_angle)) / np.pi
+        self.assertAlmostEqual(reward, expected, places=6)
+
+    def test_telescopes_along_a_non_monotonic_path_beyond_range(self):
+        angles = [1.0, 0.6, 0.9, 0.3, -0.2]
+        dist = gym_env.PREDATOR_CHARGE_RANGE + 5.0
+        total = sum(
+            gym_env.predator_face_reward(angles[i], angles[i + 1], dist)
+            for i in range(len(angles) - 1)
+        )
+        direct = gym_env.predator_face_reward(angles[0], angles[-1], dist)
+        self.assertAlmostEqual(total, direct, places=6)
+
+    def test_oscillating_facing_direction_nets_to_zero(self):
+        # A removed FRUIT_DISCOVERY_BONUS-style exploit farmed reward by sweeping
+        # facing back and forth. Potential-based shaping should make any full
+        # back-and-forth cycle in the angle net to exactly zero.
+        dist = gym_env.PREDATOR_CHARGE_RANGE + 5.0
+        angle_sequence = [1.0, 0.2, 1.2, 0.1, 1.0]  # ends where it started
+        total = sum(
+            gym_env.predator_face_reward(angle_sequence[i], angle_sequence[i + 1], dist)
+            for i in range(len(angle_sequence) - 1)
+        )
+        self.assertAlmostEqual(total, 0.0, places=6)
 
 
 if __name__ == "__main__":
