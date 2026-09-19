@@ -2,13 +2,16 @@ import random
 import numpy as np
 from src.utils.DTOs import ActionRequest
 
-def action_decision(observation_response: dict, rng: random.Random):
+def action_decision(observation_response: dict, rng: random.Random, sim_time: float = 0.0):
     """
     Dummy action selection for the agent
-    
+
     Args:
         observation_response (dict): Observation response from the environment
         rng (random.Random): Random number generator
+        sim_time (float): Current episode time in seconds (unused here - kept so this
+            stays a drop-in swap for learning_agent_policy.action_decision, which does
+            use it)
 
     Returns:
         ActionRequest: Action decision

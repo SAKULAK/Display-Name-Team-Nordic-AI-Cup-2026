@@ -36,7 +36,7 @@ def local_simulation(verbose=True):
         
         actions = []
         for agent, agent_state in zip(sim.env.agents, state["observations"]):
-            action = action_decision(agent_state, action_rng)
+            action = action_decision(agent_state, action_rng, state["sim_time"])
             actions.append((agent.agent_id, action))
 
         if verbose:

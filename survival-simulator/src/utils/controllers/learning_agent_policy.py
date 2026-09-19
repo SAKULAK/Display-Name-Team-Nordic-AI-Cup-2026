@@ -23,7 +23,13 @@ _model.load_state_dict(_checkpoint["model"])
 _model.eval()
 
 
-def action_decision(observation_response: dict, rng: random.Random):
+# Fixed episode length per the game rules (3000 simulated seconds / 30000 ticks),
+# not something learned from observation_response - matches SurvivalEnv's default
+# max_time used during training.
+MAX_EPISODE_SECONDS = 3000.0
+
+
+def action_decision(observation_response: dict, rng: random.Random, sim_time: float = 0.0):
     """
     Trained-policy action selection for the agent.
 
@@ -33,8 +39,10 @@ def action_decision(observation_response: dict, rng: random.Random):
 
     Args:
         observation_response (dict): Observation response from the environment
-        rng (random.Random): Random number generator ( unused since I just wanted to replace the import 
+        rng (random.Random): Random number generator ( unused since I just wanted to replace the import
         for the dummy_agent that uses it to insert my own agents. spywork)
+        sim_time (float): Current episode time in seconds - the observation includes
+            episode-progress as a feature, so this needs to match what training fed in.
 
     Returns:
         ActionRequest: Action decision
@@ -42,7 +50,8 @@ def action_decision(observation_response: dict, rng: random.Random):
     agent_id = observation_response["agent_id"]
     sprint_speed = observation_response["sprint_speed"]
 
-    obs = encode_observation(observation_response)
+    sim_time_frac = min(sim_time / MAX_EPISODE_SECONDS, 1.0)
+    obs = encode_observation(observation_response, sim_time_frac)
     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
     with torch.no_grad():

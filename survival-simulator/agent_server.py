@@ -14,7 +14,7 @@ def predict(step: StepResponse = Body(...)):
     Receives the current simulation state and returns actions for all agents.
     """
     rng = random.Random(1)  # deterministic for testing
-    actions = [action_decision(agent.dict(), rng).dict() for agent in step.agent_status]
+    actions = [action_decision(agent.dict(), rng, step.sim_time).dict() for agent in step.agent_status]
     
     # Must return {"actions": [...]} format
     return {"actions": actions}

@@ -33,15 +33,29 @@ NORM_MAX_ENERGY = 1000.0
 
 BIOME_TYPES = ["forest", "grassland", "swamp", "desert", "river"]
 
-OWN_STATE_DIM = 8
+# own-state features: energy_frac, age, speed, sprint_speed, hearing_radius,
+# vision_angle, vision_range, max_energy, sim_time_frac (episode progress)
+OWN_STATE_DIM = 9
+# Per-entity-slot feature widths. Angles are encoded as (sin, cos) pairs, not a raw
+# linear value, since a linear encoding is discontinuous right where real angles wrap
+# around , forcing an awkward, avoidable discontinuity onto exactly
+# the case ("something is behind me") that matters most for predator awareness. Each
+# slot also ends with an explicit presence flag (1.0 for a real entry, 0.0 for a
+# zero-padded empty slot) so "no entity here" isn't otherwise indistinguishable from
+# "a real entity sits at angle=0" once angle stops being a single raw number.
+FRUIT_SLOT_DIM = 4      # distance, sin(angle), cos(angle), presence
+TREE_SLOT_DIM = 4       # distance, sin(angle), cos(angle), presence
+EDGE_SLOT_DIM = 4        # distance, sin(angle), cos(angle), presence
+AGENT_SLOT_DIM = 6      # distance, sin(angle), cos(angle), sin(rel_dir), cos(rel_dir), presence
+PREDATOR_SLOT_DIM = 6   # distance, sin(angle), cos(angle), sin(rel_dir), cos(rel_dir), presence
 OBS_DIM = (
     OWN_STATE_DIM
     + len(BIOME_TYPES)
-    + K_FRUIT * 2
-    + K_AGENT * 3
-    + K_PREDATOR * 3
-    + K_TREE * 2
-    + K_EDGE * 2
+    + K_FRUIT * FRUIT_SLOT_DIM
+    + K_AGENT * AGENT_SLOT_DIM
+    + K_PREDATOR * PREDATOR_SLOT_DIM
+    + K_TREE * TREE_SLOT_DIM
+    + K_EDGE * EDGE_SLOT_DIM
 )
 
 # Reward shaping
@@ -106,12 +120,19 @@ def _bucket(entries, k: int, sort_key, feature_fn, n_features: int) -> np.ndarra
 
 
 def _dist_angle(obs: dict) -> np.ndarray:
-    return np.array([obs["distance"] / NORM_DIST, obs["angle"] / np.pi], dtype=np.float32)
+    angle = obs["angle"]
+    return np.array(
+        [obs["distance"] / NORM_DIST, np.sin(angle), np.cos(angle), 1.0],
+        dtype=np.float32,
+    )
 
 
 def _dist_angle_dir(obs: dict) -> np.ndarray:
+    angle = obs["angle"]
+    rel_dir = obs["rel_dir"]
     return np.array(
-        [obs["distance"] / NORM_DIST, obs["angle"] / np.pi, obs["rel_dir"] / np.pi],
+        [obs["distance"] / NORM_DIST, np.sin(angle), np.cos(angle),
+         np.sin(rel_dir), np.cos(rel_dir), 1.0],
         dtype=np.float32,
     )
 
@@ -126,7 +147,7 @@ def _edge_feat(obs: dict) -> np.ndarray:
     mx, my = (sx + ex) / 2.0, (sy + ey) / 2.0
     dist = np.hypot(mx, my)
     angle = np.arctan2(my, mx)
-    return np.array([dist / NORM_DIST, angle / np.pi], dtype=np.float32)
+    return np.array([dist / NORM_DIST, np.sin(angle), np.cos(angle), 1.0], dtype=np.float32)
 
 
 def _nearest_fruit_distance(status: dict):
@@ -141,8 +162,13 @@ def _nearest_predator_distance(status: dict):
     return min(predator_distances) if predator_distances else None
 
 
-def encode_observation(status: dict) -> np.ndarray:
-    """Turn one agent's ObservationResponse dict into a fixed-size float32 vector."""
+def encode_observation(status: dict, sim_time_frac: float) -> np.ndarray:
+    """Turn one agent's ObservationResponse dict into a fixed-size float32 vector.
+
+    sim_time_frac: current episode time / max_time, clipped to [0, 1] - gives the
+    agent a sense of how far into the episode it is, since nothing in status itself
+    (ObservationResponse has no time field) exposes that.
+    """
     own = np.array([
         status["energy"] / max(status["max_energy"], 1e-6),
         min(status["age"] / NORM_AGE, 2.0),
@@ -152,6 +178,7 @@ def encode_observation(status: dict) -> np.ndarray:
         status["vision_angle"] / np.pi,
         status["vision_range"] / NORM_DIST,
         status["max_energy"] / NORM_MAX_ENERGY,
+        sim_time_frac,
     ], dtype=np.float32)
 
     biome_onehot = np.zeros(len(BIOME_TYPES), dtype=np.float32)
@@ -172,11 +199,11 @@ def encode_observation(status: dict) -> np.ndarray:
         elif obs_type == "Edge":
             edges.append(obs)
 
-    fruit_vec = _bucket(fruits, K_FRUIT, lambda o: o["distance"], _dist_angle, 2)
-    agent_vec = _bucket(agents, K_AGENT, lambda o: o["distance"], _dist_angle_dir, 3)
-    predator_vec = _bucket(predators, K_PREDATOR, lambda o: o["distance"], _dist_angle_dir, 3)
-    tree_vec = _bucket(trees, K_TREE, lambda o: o["distance"], _dist_angle, 2)
-    edge_vec = _bucket(edges, K_EDGE, _edge_midpoint_dist, _edge_feat, 2)
+    fruit_vec = _bucket(fruits, K_FRUIT, lambda o: o["distance"], _dist_angle, FRUIT_SLOT_DIM)
+    agent_vec = _bucket(agents, K_AGENT, lambda o: o["distance"], _dist_angle_dir, AGENT_SLOT_DIM)
+    predator_vec = _bucket(predators, K_PREDATOR, lambda o: o["distance"], _dist_angle_dir, PREDATOR_SLOT_DIM)
+    tree_vec = _bucket(trees, K_TREE, lambda o: o["distance"], _dist_angle, TREE_SLOT_DIM)
+    edge_vec = _bucket(edges, K_EDGE, _edge_midpoint_dist, _edge_feat, EDGE_SLOT_DIM)
 
     return np.concatenate([own, biome_onehot, fruit_vec, agent_vec, predator_vec, tree_vec, edge_vec])
 
@@ -265,7 +292,8 @@ class SurvivalEnv(gym.Env):
         }
         self._search_ref_pos = {agent.agent_id: (agent.x, agent.y) for agent in self.sim.env.agents}
 
-        obs = {aid: encode_observation(status) for aid, status in self._last_status.items()}
+        sim_time_frac = min(self.sim.env.time / self.max_time, 1.0)
+        obs = {aid: encode_observation(status, sim_time_frac) for aid, status in self._last_status.items()}
         return obs, {}
 
     def step(self, actions: Dict[int, Tuple[np.ndarray, float]]):
@@ -304,6 +332,7 @@ class SurvivalEnv(gym.Env):
         alive_ids = set(alive_status.keys())
         died_ids = prev_alive_ids - alive_ids
         time_up = self.sim.env.time >= self.max_time
+        sim_time_frac = min(self.sim.env.time / self.max_time, 1.0)
 
         obs, rewards, terminated, truncated, infos = {}, {}, {}, {}, {}
         updated_search_ref: Dict[int, Tuple[float, float]] = {}
@@ -353,7 +382,7 @@ class SurvivalEnv(gym.Env):
                 + predator_avoid_reward
                 + spawn_reward
             )
-            obs[agent_id] = encode_observation(status)
+            obs[agent_id] = encode_observation(status, sim_time_frac)
             terminated[agent_id] = False
             truncated[agent_id] = time_up
             infos[agent_id] = {}
