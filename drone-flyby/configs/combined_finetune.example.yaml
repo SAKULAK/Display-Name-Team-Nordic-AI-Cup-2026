@@ -1,0 +1,23 @@
+# Portable template. Copy into the generated dataset root as data.yaml only
+# if relocating an existing dataset; set path to its actual absolute location.
+# Normally prepare_combined_finetune_dataset.py writes this automatically.
+path: REPLACE_WITH_ABSOLUTE_COMBINED_DATASET_DIRECTORY
+train: images/train
+val: images/val
+names:
+  0: hangar
+  1: helicopter
+  2: jet_plane
+  3: large_launcher
+  4: large_tower
+  5: medium_launcher
+  6: medium_plane
+  7: mine_roller
+  8: small_launcher
+  9: small_plane
+  10: small_tower
+  11: ta-ta
+  12: tank
+  13: condor
+  14: jammer
+  15: spacecraft

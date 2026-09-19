@@ -2,7 +2,36 @@
 annotated/
 datasets/
 runs/
+validation_recon_images/
 *.pt
+
+# External images / reproducible generated datasets. Portable config templates
+# live in configs/; machine-specific generated data.yaml files stay external.
+captures/
+drone-captures/
+l1_phase_*/
+l0_repeat*/
+reconstructed_l1/
+projected_l1_labels*/
+validation_yolo*/
+combined_finetune*/
+*.cache
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.tmp
+*.reserve
+
+# Regenerable diagnostic dumps, not human annotations.
+validation_predictions*.json
+validation_errors*.csv
+handoff_logs/
+# Keep validation_cvat.json, reconstruction_annotations.json, source/configs,
+# tests and docs versionable. No blanket *.json or *.yaml exclusions.
 
 # Generic Python files (Source: https://github.com/github/gitignore/blob/main/Python.gitignore)
 __pycache__/

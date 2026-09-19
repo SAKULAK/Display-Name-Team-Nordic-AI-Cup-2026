@@ -1,0 +1,17 @@
+{
+  "baseline_checkpoint": "runs/detect/helsinki_yolov8n_multires_rot/weights/best.pt",
+  "baseline_sha256": "fdde1220cfbd5a4c82daf49dff0986f55e6b936f87e53a51096fa08511587159",
+  "helsinki_dataset": "datasets/helsinki_multires",
+  "cvat": "validation_cvat.json",
+  "reviewed_frames": 180,
+  "human_boxes": 687,
+  "validation_holdout_start_frame": 200,
+  "validation_holdout_end_frame": 249,
+  "minimum_visible_fraction": 0.7,
+  "fresh_run_name": "validation_finetune_v1",
+  "fresh_epochs": 100,
+  "fresh_imgsz": 960,
+  "fresh_batch": 4,
+  "fresh_workers": 0,
+  "device": "0"
+}

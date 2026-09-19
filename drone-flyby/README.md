@@ -1,5 +1,9 @@
 # Drone flyby
 
+**Teammates:** start with [TEAM_HANDOFF.md](TEAM_HANDOFF.md) for current model status,
+annotations and fresh/resume training, then [EXTERNAL_DATA.md](EXTERNAL_DATA.md)
+for the Google Drive data layout and reproducible dataset preparation commands.
+
 A survey drone flies a straight line 600 metres above a simulated landscape,
 filming the ground as it goes. Your job is to find the objects down there —
 vehicles, aircraft, towers and hangars — and say what and where they are.
