@@ -138,6 +138,27 @@ SPAWN_REWARD = 2.0
 # parent one bad tick from starving isn't rewarded as generously as a safe one.
 SPAWN_SAFETY_MARGIN = 50.0
 
+# SPAWN_REWARD also tapers down (independently of the energy-safety scaling above)
+# as the current population climbs from POPULATION_TAPER_START toward
+# POPULATION_TAPER_END, reaching zero bonus at/beyond POPULATION_TAPER_END - full
+# credit below POPULATION_TAPER_START, same as before. Population size only makes
+# the reward *smaller*, never negative, so this can't create the same
+# "hastening a bad outcome becomes cheaper" pathology STILLNESS_PENALTY_COEF's
+# uncapped version had - there's no downside to skip by not reproducing.
+#
+# Observed population peaks of 27-37 agents (vs. 5 starting) coincided with score
+# plateauing/oscillating in a boom-bust pattern: growth itself drives per-capita
+# food scarcity (see CURRICULUM_FRUIT_MULT_END/CURRICULUM_TREE_MULT_END in
+# train.py, raised to work alongside this), which then triggers a die-off, which
+# lets food recover, repeat. This makes the *decision* to reproduce
+# population-aware, the same way it's already energy-safety-aware, rather than
+# leaving population size to grow unchecked against a food supply that can't
+# support it indefinitely. Thresholds picked from that same observed range, not a
+# rigorously derived carrying capacity - needs the same real-gameplay
+# verification as everything else here before fully trusting the exact numbers.
+POPULATION_TAPER_START = 15
+POPULATION_TAPER_END = 35
+
 # Reward for how aligned this tick's actual displacement is with the previous tick's,
 # scaled by how far it moved this tick. Sustained, committed movement in roughly one
 # direction scores high; a random walk's consecutive directions are independent by
@@ -341,15 +362,19 @@ def predator_face_reward(prev_angle, curr_angle, curr_distance) -> float:
     return PREDATOR_FACE_COEF * (abs(prev_angle) - abs(curr_angle)) / np.pi
 
 
-def spawn_reward(pre_spawn_energy: float) -> float:
-    """SPAWN_REWARD scaled by how much energy remains after the 100 spawn cost, or
-    0.0 if spawning wasn't actually possible (mirrors Environment.agent_step's own
-    `energy > 100` gate exactly)."""
+def spawn_reward(pre_spawn_energy: float, population_size: int) -> float:
+    """SPAWN_REWARD scaled by how much energy remains after the 100 spawn cost (0.0
+    if spawning wasn't actually possible - mirrors Environment.agent_step's own
+    `energy > 100` gate exactly), further scaled down as population_size climbs
+    through POPULATION_TAPER_START..POPULATION_TAPER_END. Both scaling factors
+    apply independently and multiplicatively."""
     if pre_spawn_energy <= 100:
         return 0.0
     remaining_energy = pre_spawn_energy - 100
     safety_frac = float(np.clip(remaining_energy / SPAWN_SAFETY_MARGIN, 0.0, 1.0))
-    return SPAWN_REWARD * safety_frac
+    density_span = POPULATION_TAPER_END - POPULATION_TAPER_START
+    density_frac = float(np.clip((POPULATION_TAPER_END - population_size) / density_span, 0.0, 1.0))
+    return SPAWN_REWARD * safety_frac * density_frac
 
 
 def encode_observation(status: dict, sim_time_frac: float) -> np.ndarray:
@@ -520,7 +545,7 @@ class SurvivalEnv(gym.Env):
                 continuous_action, spawn_action, status["sprint_speed"]
             )
             if spawn_agent:
-                spawn_reward_for[agent_id] = spawn_reward(status["energy"])
+                spawn_reward_for[agent_id] = spawn_reward(status["energy"], len(self._last_status))
             action_requests.append((agent_id, ActionRequest(
                 agent_id=agent_id,
                 move_distance=move_distance,

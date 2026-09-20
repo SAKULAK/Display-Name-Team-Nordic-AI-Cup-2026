@@ -67,30 +67,65 @@ class PredatorAvoidRewardTests(unittest.TestCase):
 
 
 class SpawnRewardTests(unittest.TestCase):
+    """population_size is held at 1 (well below POPULATION_TAPER_START) throughout
+    this class so these tests isolate the energy-safety scaling exactly as before;
+    see SpawnRewardPopulationTaperTests for the population-density scaling."""
+
     def test_at_or_below_gate_energy_gives_zero(self):
-        self.assertEqual(gym_env.spawn_reward(100.0), 0.0)
-        self.assertEqual(gym_env.spawn_reward(50.0), 0.0)
-        self.assertEqual(gym_env.spawn_reward(0.0), 0.0)
+        self.assertEqual(gym_env.spawn_reward(100.0, 1), 0.0)
+        self.assertEqual(gym_env.spawn_reward(50.0, 1), 0.0)
+        self.assertEqual(gym_env.spawn_reward(0.0, 1), 0.0)
 
     def test_barely_above_gate_gives_near_zero(self):
         # Barely-legal spawn (100.01 energy) should net a tiny fraction of the full
         # reward, not the full amount - this is exactly the reckless-breeding case
         # SPAWN_SAFETY_MARGIN scaling was added to stop being profitable.
-        reward = gym_env.spawn_reward(100.01)
+        reward = gym_env.spawn_reward(100.01, 1)
         self.assertGreater(reward, 0.0)
         self.assertLess(reward, gym_env.SPAWN_REWARD * 0.01)
 
     def test_full_safety_margin_gives_full_reward(self):
         energy = 100.0 + gym_env.SPAWN_SAFETY_MARGIN
-        self.assertAlmostEqual(gym_env.spawn_reward(energy), gym_env.SPAWN_REWARD, places=6)
+        self.assertAlmostEqual(gym_env.spawn_reward(energy, 1), gym_env.SPAWN_REWARD, places=6)
 
     def test_beyond_safety_margin_still_caps_at_full_reward(self):
-        self.assertAlmostEqual(gym_env.spawn_reward(1000.0), gym_env.SPAWN_REWARD, places=6)
+        self.assertAlmostEqual(gym_env.spawn_reward(1000.0, 1), gym_env.SPAWN_REWARD, places=6)
 
     def test_scales_linearly_within_margin(self):
         half_margin_energy = 100.0 + gym_env.SPAWN_SAFETY_MARGIN / 2
-        reward = gym_env.spawn_reward(half_margin_energy)
+        reward = gym_env.spawn_reward(half_margin_energy, 1)
         self.assertAlmostEqual(reward, gym_env.SPAWN_REWARD / 2, places=6)
+
+
+class SpawnRewardPopulationTaperTests(unittest.TestCase):
+    """Energy is held comfortably above SPAWN_SAFETY_MARGIN throughout this class
+    (1000.0) so these tests isolate the population-density scaling exactly."""
+
+    def test_at_or_below_taper_start_gives_full_reward(self):
+        self.assertAlmostEqual(
+            gym_env.spawn_reward(1000.0, gym_env.POPULATION_TAPER_START), gym_env.SPAWN_REWARD, places=6
+        )
+        self.assertAlmostEqual(gym_env.spawn_reward(1000.0, 1), gym_env.SPAWN_REWARD, places=6)
+
+    def test_at_or_beyond_taper_end_gives_zero(self):
+        self.assertEqual(gym_env.spawn_reward(1000.0, gym_env.POPULATION_TAPER_END), 0.0)
+        self.assertEqual(gym_env.spawn_reward(1000.0, gym_env.POPULATION_TAPER_END + 50), 0.0)
+
+    def test_scales_linearly_within_taper_range(self):
+        midpoint = (gym_env.POPULATION_TAPER_START + gym_env.POPULATION_TAPER_END) // 2
+        reward = gym_env.spawn_reward(1000.0, midpoint)
+        self.assertAlmostEqual(reward, gym_env.SPAWN_REWARD / 2, places=1)
+
+    def test_never_negative_regardless_of_population_size(self):
+        # No "reward for not spawning" pathway exists - crowding can only reduce the
+        # bonus toward zero, never create a downside to weigh against not breeding.
+        self.assertGreaterEqual(gym_env.spawn_reward(1000.0, 10_000), 0.0)
+
+    def test_energy_and_density_scaling_are_independent_and_multiplicative(self):
+        half_energy = 100.0 + gym_env.SPAWN_SAFETY_MARGIN / 2
+        midpoint = (gym_env.POPULATION_TAPER_START + gym_env.POPULATION_TAPER_END) // 2
+        reward = gym_env.spawn_reward(half_energy, midpoint)
+        self.assertAlmostEqual(reward, gym_env.SPAWN_REWARD * 0.5 * 0.5, places=1)
 
 
 class SearchRewardAndRefTests(unittest.TestCase):
