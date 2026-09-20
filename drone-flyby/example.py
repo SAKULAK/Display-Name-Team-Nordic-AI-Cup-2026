@@ -17,6 +17,7 @@ from dtos import (
 )
 from utils import decode_view
 from detector import get_detector
+from tracker import track
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,15 @@ def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDt
     # Never let a modelling error cost you the frame. An empty list still
     # scores the frame; an exception loses it and every detection in it.
     try:
-        annotations = detect(image, request)
+        fresh = detect(image, request)
     except Exception:
         logger.exception('Detector failed on frame %s', request.frame)
-        annotations = []
+        fresh = []
+
+    # Fuse this frame's detections with what earlier frames already found.
+    # Even an empty ``fresh`` still lets already-tracked objects propagate
+    # forward from wherever the camera was pointed before.
+    annotations = track(request.sequence_id, request.frame, fresh)
 
     return DroneFlybyPredictResponseDto(
         # These two must come straight back from the request, unchanged.
