@@ -79,6 +79,8 @@ def choose_next_view(request):
     mode = os.environ.get('CAMERA_POLICY', 'hold_full').strip().lower()
     if mode == 'baseline_sweep':
         return baseline_sweep(request)
+    if mode == 'l1_cycle':
+        return l1_cycle(request)
     if mode != 'hold_full':
         raise ValueError(f'Unknown CAMERA_POLICY: {mode!r}')
     current, constraints = request.view, request.camera_constraints
@@ -164,3 +166,66 @@ def baseline_sweep(
         center_x=centre_x,
         center_y=centre_y,
     )
+
+
+def l1_cycle(request: DroneFlybyPredictRequestDto) -> Optional[RequestedViewDto]:
+    """Loop the camera around the frame at L1, covering all of it on repeat.
+
+    The four L1 bound corners are exactly the centres of the four 1920x1080
+    quadrants that tile the full 3840x2160 frame with no gaps and no overlap
+    (L1's region size is exactly half the frame in each dimension). Visiting
+    all four covers the whole frame; the four edge midpoints between them are
+    just legal-sized hops to get there, since a straight quadrant-to-quadrant
+    jump (1920px) exceeds the L1 move limit (1102px, see
+    ``camera_constraints.maximum_center_delta``) and takes two hops anyway.
+
+    Measured against the Helsinki annotations, objects cross the whole
+    2160px frame at roughly 55-80px/frame, i.e. they are in the frame for
+    about 30 frames. This 8-hop loop (4 quadrant dwells + 4 transit hops)
+    keeps every point in the frame within one L1 dwell every 8 frames, well
+    inside that window, so the tracker in ``tracker.py`` only ever has to
+    bridge short gaps rather than a policy that permanently moves on.
+
+    Deliberately stateless (recomputed from ``request.view`` every call, like
+    ``baseline_sweep``): if a requested move is ever rejected, the next call
+    just resumes from wherever the camera actually is instead of drifting out
+    of sync with an internally remembered index.
+    """
+    constraints = request.camera_constraints
+    current = request.view
+    bounds = constraints.bounds_for_level(1)
+    if bounds is None:
+        return None
+    min_x, max_x = bounds.minimum_center_x, bounds.maximum_center_x
+    min_y, max_y = bounds.minimum_center_y, bounds.maximum_center_y
+    mid_x, mid_y = (min_x + max_x) // 2, (min_y + max_y) // 2
+
+    # Clockwise: TL -> top-mid -> TR -> right-mid -> BR -> bottom-mid -> BL -> left-mid -> TL
+    waypoints = [
+        (min_x, min_y), (mid_x, min_y),
+        (max_x, min_y), (max_x, mid_y),
+        (max_x, max_y), (mid_x, max_y),
+        (min_x, max_y), (min_x, mid_y),
+    ]
+
+    if current.resolution_level == 0:
+        if 1 not in constraints.allowed_resolution_levels:
+            return None
+        target_x, target_y = waypoints[0]
+    else:
+        # Find where we already are in the loop and advance one hop. Exact
+        # match is expected since we only ever request waypoint coordinates.
+        try:
+            current_index = waypoints.index((current.center_x, current.center_y))
+            target_x, target_y = waypoints[(current_index + 1) % len(waypoints)]
+        except ValueError:
+            # Off-loop (e.g. a stale/rejected command): head for the nearest
+            # waypoint rather than the geometrically next one.
+            target_x, target_y = min(
+                waypoints,
+                key=lambda point: math.hypot(point[0] - current.center_x, point[1] - current.center_y),
+            )
+
+    if math.hypot(target_x - current.center_x, target_y - current.center_y) > constraints.maximum_center_delta:
+        return None
+    return RequestedViewDto(resolution_level=1, center_x=int(target_x), center_y=int(target_y))

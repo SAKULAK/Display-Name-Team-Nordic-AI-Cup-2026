@@ -49,6 +49,13 @@ class YoloDetector:
             raise ValueError('Checkpoint classes must exactly match dtos.OBJECT_CLASSES')
         self.confidence, self.iou, self.device = confidence, iou, device
         self.lock = Lock()
+        # First inference is much slower than the rest (CUDA context, kernel
+        # autotuning, etc.) and there is no separate timing allowance for it
+        # in an attempt. Pay that cost now, not on frame 0.
+        dummy = np.zeros((540, 960, 3), dtype=np.uint8)
+        self.model.predict(dummy, imgsz=960, conf=self.confidence, iou=self.iou,
+                            agnostic_nms=self.agnostic_nms, max_det=1,
+                            device=self.device, verbose=False)
 
     def detect(self, image, request):
         if image.shape != (540, 960, 3) or image.dtype != np.uint8:
