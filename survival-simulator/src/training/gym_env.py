@@ -90,6 +90,28 @@ SEARCH_COEF = 0.1
 # rewards longer, more sustained excursions before the signal fades.
 SEARCH_EMA_ALPHA = 0.02
 
+# Flat penalty for near-zero actual displacement (same near-zero cutoff
+# momentum_reward uses) on a tick where no fruit is currently observed. Movement
+# itself costs energy (see update_entity_position's walking/sprinting cost) while
+# standing still doesn't, so ENERGY_SHAPING_COEF alone already nudges toward
+# staying put; SEARCH_COEF/MOMENTUM_COEF only reward good movement; nothing
+# previously made *not* moving while blind actively worse. Gated on fruit
+# specifically (not predators/trees/agents) since that's the thing actually worth
+# searching for - a stationary agent that's reacting to something else it can see
+# isn't the "just waiting" pattern this targets.
+#
+# Applied only for the first STILLNESS_STREAK_CAP consecutive still-and-blind
+# ticks (see stillness_penalty/_still_streak), not indefinitely: an *unbounded*
+# recurring penalty creates a real, verified pathology - once a stuck agent's
+# remaining stretch of penalized ticks would cost more than DEATH_PENALTY's flat
+# -2.0, dying sooner becomes cheaper than continuing to search, which is exactly
+# backwards. Capping the streak bounds any one stuck-spell's total cost well below
+# DEATH_PENALTY (30 * 0.05 = 1.5 < 2.0) so enduring is always cheaper than dying,
+# while still giving a sharp, real deterrent against the actually-observed pattern
+# (brief repeated stalls), not permanent paralysis.
+STILLNESS_PENALTY_COEF = 0.05
+STILLNESS_STREAK_CAP = 30
+
 # Mirror of FRUIT_APPROACH_COEF, sign flipped: reward increasing distance to the
 # nearest known predator, penalize closing it. More directly attributable
 # than relying solely on DEATH_PENALTY
@@ -203,6 +225,21 @@ def _nearest_fruit_distance(status: dict):
     return min(fruit_distances) if fruit_distances else None
 
 
+def _fruit_within_hearing(status: dict) -> bool:
+    """Whether any fruit is within hearing_radius - unlike vision, hearing isn't
+    gated on facing direction (see creature.py's observe()), so this can't be
+    inflated by rotating in place. Used specifically as STILLNESS_PENALTY_COEF's
+    gate instead of _nearest_fruit_distance's vision+hearing-inclusive result: a
+    vision-based gate would let an agent dodge the penalty by sweeping its facing
+    direction across more of its vision cone without ever translating - the same
+    cone-sweep pattern a removed FRUIT_DISCOVERY_BONUS had to be removed over."""
+    hearing_radius = status["hearing_radius"]
+    return any(
+        o["type"] == "Fruit" and o["distance"] <= hearing_radius
+        for o in status["observations"]
+    )
+
+
 def _nearest_predator_distance(status: dict):
     """Raw (unnormalized) distance to the closest currently seen/heard predator, or None."""
     predator_distances = [o["distance"] for o in status["observations"] if o["type"] == "Predator"]
@@ -245,6 +282,31 @@ def search_reward_and_ref(curr_pos: Tuple[float, float], ref_pos: Tuple[float, f
         ref_pos[1] + SEARCH_EMA_ALPHA * (curr_pos[1] - ref_pos[1]),
     )
     return reward, new_ref
+
+
+def stillness_streak(prev_streak: int, curr_disp, fruit_observed: bool) -> int:
+    """Updated consecutive still-and-blind tick count, for stillness_penalty.
+    Resets to 0 the moment the agent moves (curr_disp not ~zero, same cutoff
+    momentum_reward uses) or a fruit comes within hearing; otherwise increments.
+    fruit_observed should come from _fruit_within_hearing, not
+    _nearest_fruit_distance - it needs to be facing-independent, or rotating in
+    place could satisfy it without ever actually moving."""
+    if curr_disp is None:
+        return 0
+    curr_mag = float(np.hypot(curr_disp[0], curr_disp[1]))
+    if curr_mag >= 1e-6 or fruit_observed:
+        return 0
+    return prev_streak + 1
+
+
+def stillness_penalty(streak: int) -> float:
+    """See STILLNESS_PENALTY_COEF/STILLNESS_STREAK_CAP. -STILLNESS_PENALTY_COEF for
+    streak in [1, STILLNESS_STREAK_CAP] (an ongoing still-and-blind spell, still
+    within the capped window); 0.0 outside that range, including streak=0 (moving,
+    or a fruit is within hearing) and streak > STILLNESS_STREAK_CAP (capped)."""
+    if 1 <= streak <= STILLNESS_STREAK_CAP:
+        return -STILLNESS_PENALTY_COEF
+    return 0.0
 
 
 def momentum_reward(prev_disp, curr_disp) -> float:
@@ -395,6 +457,7 @@ class SurvivalEnv(gym.Env):
         self._prev_position: Dict[int, Tuple[float, float]] = {}
         self._prev_displacement: Dict[int, Tuple[float, float]] = {}
         self._prev_predator_angle: Dict[int, float] = {}
+        self._still_streak: Dict[int, int] = {}
         self._predator_speed_mult = 1.0
 
     def set_difficulty(self, fruit_mult: float = 1.0, tree_mult: float = 1.0, predator_speed_mult: float = 1.0):
@@ -434,6 +497,7 @@ class SurvivalEnv(gym.Env):
         self._search_ref_pos = {agent.agent_id: (agent.x, agent.y) for agent in self.sim.env.agents}
         self._prev_position = {agent.agent_id: (agent.x, agent.y) for agent in self.sim.env.agents}
         self._prev_displacement = {agent.agent_id: (0.0, 0.0) for agent in self.sim.env.agents}
+        self._still_streak = {agent.agent_id: 0 for agent in self.sim.env.agents}
 
         sim_time_frac = min(self.sim.env.time / self.max_time, 1.0)
         obs = {aid: encode_observation(status, sim_time_frac) for aid, status in self._last_status.items()}
@@ -467,6 +531,7 @@ class SurvivalEnv(gym.Env):
         prev_search_ref = self._search_ref_pos
         prev_position = self._prev_position
         prev_displacement = self._prev_displacement
+        prev_still_streak = self._still_streak
 
         state = self.sim.step(action_requests)
 
@@ -480,6 +545,7 @@ class SurvivalEnv(gym.Env):
         updated_search_ref: Dict[int, Tuple[float, float]] = {}
         updated_position: Dict[int, Tuple[float, float]] = {}
         updated_displacement: Dict[int, Tuple[float, float]] = {}
+        updated_still_streak: Dict[int, int] = {}
 
         for agent_id in alive_ids:
             status = alive_status[agent_id]
@@ -509,10 +575,16 @@ class SurvivalEnv(gym.Env):
                 prev_pos = prev_position.get(agent_id, curr_pos)
                 curr_disp = (curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1])
                 move_reward = momentum_reward(prev_displacement.get(agent_id), curr_disp)
+                streak = stillness_streak(
+                    prev_still_streak.get(agent_id, 0), curr_disp, fruit_observed=_fruit_within_hearing(status)
+                )
+                still_penalty = stillness_penalty(streak)
                 updated_position[agent_id] = curr_pos
                 updated_displacement[agent_id] = curr_disp
+                updated_still_streak[agent_id] = streak
             else:
                 move_reward = 0.0
+                still_penalty = 0.0
 
             agent_spawn_reward = spawn_reward_for.get(agent_id, 0.0)
 
@@ -523,6 +595,7 @@ class SurvivalEnv(gym.Env):
                 + pred_reward
                 + face_reward
                 + move_reward
+                + still_penalty
                 + agent_spawn_reward
             )
             obs[agent_id] = encode_observation(status, sim_time_frac)
@@ -548,6 +621,7 @@ class SurvivalEnv(gym.Env):
         self._search_ref_pos = updated_search_ref
         self._prev_position = updated_position
         self._prev_displacement = updated_displacement
+        self._still_streak = updated_still_streak
 
         terminated["__all__"] = state["num_agents"] == 0
         truncated["__all__"] = time_up

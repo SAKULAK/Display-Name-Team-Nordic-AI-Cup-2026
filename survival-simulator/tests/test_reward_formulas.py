@@ -183,6 +183,46 @@ class MomentumRewardTests(unittest.TestCase):
         self.assertAlmostEqual(base, rotated, places=6)
 
 
+class StillnessStreakTests(unittest.TestCase):
+    def test_none_disp_gives_zero(self):
+        self.assertEqual(gym_env.stillness_streak(5, None, fruit_observed=False), 0)
+
+    def test_fruit_observed_resets_to_zero_even_if_stationary(self):
+        self.assertEqual(gym_env.stillness_streak(5, (0.0, 0.0), fruit_observed=True), 0)
+
+    def test_moving_resets_to_zero(self):
+        self.assertEqual(gym_env.stillness_streak(5, (5.0, 0.0), fruit_observed=False), 0)
+
+    def test_stationary_and_blind_increments(self):
+        self.assertEqual(gym_env.stillness_streak(5, (0.0, 0.0), fruit_observed=False), 6)
+
+    def test_starts_from_zero(self):
+        self.assertEqual(gym_env.stillness_streak(0, (0.0, 0.0), fruit_observed=False), 1)
+
+    def test_tiny_but_nonzero_displacement_still_counts_as_stationary(self):
+        # Matches momentum_reward's own near-zero cutoff (1e-6) exactly, so the two
+        # terms agree on what "not moving" means.
+        self.assertEqual(gym_env.stillness_streak(2, (1e-9, 0.0), fruit_observed=False), 3)
+
+
+class StillnessPenaltyTests(unittest.TestCase):
+    def test_zero_streak_gives_zero(self):
+        self.assertEqual(gym_env.stillness_penalty(0), 0.0)
+
+    def test_streak_within_cap_gives_flat_penalty(self):
+        self.assertEqual(gym_env.stillness_penalty(1), -gym_env.STILLNESS_PENALTY_COEF)
+        self.assertEqual(gym_env.stillness_penalty(gym_env.STILLNESS_STREAK_CAP), -gym_env.STILLNESS_PENALTY_COEF)
+
+    def test_streak_beyond_cap_gives_zero(self):
+        self.assertEqual(gym_env.stillness_penalty(gym_env.STILLNESS_STREAK_CAP + 1), 0.0)
+
+    def test_worst_case_total_penalty_is_comfortably_below_death_penalty(self):
+        # The whole point of capping: no single stuck-spell should ever be able to
+        # cost more than DEATH_PENALTY, so dying is never cheaper than enduring it.
+        worst_case_total = gym_env.STILLNESS_STREAK_CAP * gym_env.STILLNESS_PENALTY_COEF
+        self.assertLess(worst_case_total, abs(gym_env.DEATH_PENALTY))
+
+
 class PredatorFaceRewardTests(unittest.TestCase):
     def test_none_gives_zero(self):
         self.assertEqual(gym_env.predator_face_reward(None, 0.5, 200.0), 0.0)

@@ -9,7 +9,21 @@ import torch
 import src.training.train as train_module
 from src.training.gym_env import OBS_DIM
 from src.training.model import ActorCritic
-from src.training.train import GAMMA, GAE_LAMBDA, Trajectory, collect_rollout, compute_gae, load_checkpoint, save_checkpoint
+from src.training.train import (
+    ENTROPY_ANNEAL_UPDATES,
+    ENTROPY_COEF_END,
+    ENTROPY_COEF_START,
+    GAMMA,
+    GAE_LAMBDA,
+    REEXPLORE_ENTROPY_COEF_START,
+    REEXPLORE_ENTROPY_UPDATES,
+    Trajectory,
+    collect_rollout,
+    compute_entropy_coef,
+    compute_gae,
+    load_checkpoint,
+    save_checkpoint,
+)
 from src.training.vec_env import SubprocVecSurvivalEnv
 
 
@@ -80,6 +94,42 @@ class GAETests(unittest.TestCase):
         expected_delta = 5.0 + GAMMA * 3.0 - 2.0
         np.testing.assert_allclose(advantages, [expected_delta], atol=1e-6)
         np.testing.assert_allclose(returns, [expected_delta + 2.0], atol=1e-6)
+
+
+class ComputeEntropyCoefTests(unittest.TestCase):
+    """Normal absolute-update schedule vs. the resume-relative re-exploration bump
+    (see compute_entropy_coef's own comment) - whichever is higher wins."""
+
+    def test_fresh_run_start_matches_normal_schedule_start(self):
+        # start_update=1 means the reexplore window is already "in progress" at
+        # update=1 too, but its start value (REEXPLORE_ENTROPY_COEF_START) is lower
+        # than the normal schedule's value this early, so max() picks the normal
+        # schedule - a fresh run's exploration is unaffected by this feature.
+        expected = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * (1 / ENTROPY_ANNEAL_UPDATES)
+        self.assertAlmostEqual(compute_entropy_coef(1, 1), expected, places=6)
+
+    def test_fresh_run_end_matches_normal_schedule_end(self):
+        far_update = 100_000
+        self.assertAlmostEqual(compute_entropy_coef(far_update, 1), ENTROPY_COEF_END, places=6)
+
+    def test_resumed_run_gets_bumped_above_the_decayed_floor(self):
+        # A long-converged run (normal schedule stuck at ENTROPY_COEF_END) resuming
+        # at update 1240 should get a real boost right at the moment it resumes.
+        start_update = 1240
+        coef_at_resume = compute_entropy_coef(start_update, start_update)
+        self.assertAlmostEqual(coef_at_resume, REEXPLORE_ENTROPY_COEF_START, places=6)
+        self.assertGreater(coef_at_resume, ENTROPY_COEF_END)
+
+    def test_resumed_run_bump_decays_back_to_the_floor(self):
+        start_update = 1240
+        after_window = start_update + REEXPLORE_ENTROPY_UPDATES + 1000
+        self.assertAlmostEqual(compute_entropy_coef(after_window, start_update), ENTROPY_COEF_END, places=6)
+
+    def test_resumed_run_bump_is_monotonically_decaying(self):
+        start_update = 1240
+        early = compute_entropy_coef(start_update + 10, start_update)
+        later = compute_entropy_coef(start_update + 100, start_update)
+        self.assertGreaterEqual(early, later)
 
 
 class CollectRolloutTests(unittest.TestCase):

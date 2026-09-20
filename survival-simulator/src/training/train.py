@@ -39,6 +39,18 @@ VALUE_COEF = 0.5
 ENTROPY_COEF_START = 0.03
 ENTROPY_COEF_END = 0.005
 ENTROPY_ANNEAL_UPDATES = 500
+
+# One-time re-exploration window, relative to whenever training actually resumes
+# (not the absolute update count) - added alongside STILLNESS_PENALTY_COEF. On a
+# long-running resumed checkpoint, entropy_coef has typically long since decayed to
+# ENTROPY_COEF_END, leaving little exploration budget for the policy to actually
+# sample the "keep moving while blind" behavior a new reward term is trying to make
+# it prefer - gradient pressure alone has few chances to discover it. Deliberately
+# smaller/shorter than the original START/ANNEAL_UPDATES: this is nudging one
+# specific habit, not relearning everything from a random policy, and a full-size
+# bump risks disrupting the foraging/fleeing/spawning behavior already working.
+REEXPLORE_ENTROPY_COEF_START = 0.015
+REEXPLORE_ENTROPY_UPDATES = 150
 LEARNING_RATE = 3e-4
 UPDATE_EPOCHS = 4
 # Scales with N_ENVS: total transitions per update is roughly N_ENVS * ROLLOUT_TICKS,
@@ -86,6 +98,25 @@ class Trajectory:
     log_prob: List[float] = field(default_factory=list)
     value: List[float] = field(default_factory=list)
     reward: List[float] = field(default_factory=list)
+
+
+def compute_entropy_coef(update: int, start_update: int) -> float:
+    """Entropy bonus for this update: the normal absolute-update schedule
+    (ENTROPY_COEF_START -> END over ENTROPY_ANNEAL_UPDATES), or the resume-relative
+    re-exploration bump (REEXPLORE_ENTROPY_COEF_START -> END over
+    REEXPLORE_ENTROPY_UPDATES since start_update), whichever is higher. See
+    REEXPLORE_ENTROPY_COEF_START's own comment - the max() means a fresh run
+    (start_update=1) is governed entirely by the normal schedule, since it starts
+    higher than the reexplore bump, while a long-resumed run gets a temporary boost
+    instead of staying pinned at ENTROPY_COEF_END."""
+    entropy_progress = min(1.0, update / ENTROPY_ANNEAL_UPDATES)
+    entropy_coef = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * entropy_progress
+
+    reexplore_progress = min(1.0, (update - start_update) / REEXPLORE_ENTROPY_UPDATES)
+    reexplore_entropy_coef = (
+        REEXPLORE_ENTROPY_COEF_START + (ENTROPY_COEF_END - REEXPLORE_ENTROPY_COEF_START) * reexplore_progress
+    )
+    return max(entropy_coef, reexplore_entropy_coef)
 
 
 def collect_rollout(
@@ -357,8 +388,7 @@ def train():
             )
             vec_env.set_difficulty(fruit_mult, tree_mult, predator_speed_mult)
 
-            entropy_progress = min(1.0, update / ENTROPY_ANNEAL_UPDATES)
-            entropy_coef = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * entropy_progress
+            entropy_coef = compute_entropy_coef(update, start_update)
 
             segments, episode_summaries, latest_info_per_env, obs_list = collect_rollout(
                 vec_env, model, obs_list, ROLLOUT_TICKS
