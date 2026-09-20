@@ -4,7 +4,7 @@ You should not need to change much in here. Put your model in ``example.py``
 and leave the transport alone.
 
 The URL you submit is used exactly as you give it, path included, so if you
-keep the ``/predict`` route below then submit ``http://<your-host>:9053/predict``
+keep the ``/predict`` route below then submit ``http://<your-host>:9054/predict``
 rather than just the host.
 """
 
@@ -22,7 +22,7 @@ from example import predict
 from utils import validate_response
 
 HOST = '0.0.0.0'
-PORT = 9053
+PORT = 9054
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

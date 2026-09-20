@@ -41,7 +41,22 @@ Bbox = Tuple[float, float, float, float]
 # object", within one class. Detections at IoU 0.50 or better score as a hit,
 # so 0.30 leaves room for a track that has drifted a bit without either
 # matching two different real objects or spawning a duplicate track for one.
-IOU_MATCH_THRESHOLD = 0.30
+IOU_MATCH_THRESHOLD = 0.20
+
+# Same-class NMS applied to the tracker's own output every frame. The
+# evaluator does no NMS server-side and counts overlapping duplicates as
+# false positives (see README). Duplicates happen here even within a single
+# fresh detection set -- a tiny object (e.g. small_launcher, ~5px wide once
+# downsampled to a 960x540 L0 view) lets the raw detector emit multiple
+# candidate boxes too jittery to clear its own NMS IoU (0.5), and each
+# unmatched leftover then seeds its own track next frame. Left unsuppressed
+# these compound into parallel "ghost chains": confirmed by inspecting one
+# frame's actual output, where a single real large_launcher showed up as six
+# co-existing tracks at evenly-decaying confidence, one per several missed
+# real frames, because greedy matching only ever reconnects the fresh
+# detection to whichever of the several stale duplicates currently has the
+# best IoU, leaving the others to decay in parallel instead of merging.
+DEDUP_IOU_THRESHOLD = 0.20
 
 # Confidence applied per elapsed frame a track goes unconfirmed. Chosen so a
 # track surviving ~15 missed frames (a plausible zoom-elsewhere gap) is still
@@ -50,8 +65,17 @@ IOU_MATCH_THRESHOLD = 0.30
 CONFIDENCE_DECAY_PER_FRAME = 0.93
 
 # Below this, a propagated detection is more likely wrong than right; drop it
-# rather than spend one of the 500 annotation slots on noise.
-MINIMUM_CONFIDENCE = 0.05
+# rather than spend one of the 500 annotation slots on noise. Set just under
+# the detector's own accept threshold (YOLO_CONF=0.15, found by sweeping):
+# a borderline-confidence false positive decays past it in ~3 missed frames
+# (ln(0.12/0.15)/ln(0.93)), while a real high-confidence detection (0.7-0.9
+# typical for this checkpoint) survives 20+ missed frames, which is the
+# actual point of a floor this low. Originally 0.05, tuned against
+# YOLO_CONF=0.05; that combination let one-off noise decay for ~15 missed
+# frames before expiring, and detections/frame climbed to a steady ~50
+# against ~16 real objects in the scene -- confirmed by watching the
+# server's per-frame detection counts, not just the score.
+MINIMUM_CONFIDENCE = 0.12
 
 # Hard cap regardless of decayed confidence, in case a track saturates near 1.0
 # and would otherwise take many frames to decay below the confidence floor.
@@ -93,6 +117,28 @@ def _iou(a: Bbox, b: Bbox) -> float:
     area_b = (bx2 - bx1) * (by2 - by1)
     union = area_a + area_b - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def _suppress_duplicates(tracks: List['Track']) -> List['Track']:
+    """Greedy same-class NMS, highest confidence first.
+
+    Standalone from the fresh-detection/track matching above: matching only
+    ever pairs one detection with one existing track, so it cannot merge two
+    tracks that both already exist and happen to overlap (parallel ghost
+    chains -- see DEDUP_IOU_THRESHOLD's comment). This is the cleanup pass
+    that actually collapses those, run every frame over the full surviving
+    set. ``tracks`` must already be confidence-sorted descending.
+    """
+    kept: List[Track] = []
+    for track in tracks:
+        if any(
+            other.object_id == track.object_id
+            and _iou(track.bbox, other.bbox) >= DEDUP_IOU_THRESHOLD
+            for other in kept
+        ):
+            continue
+        kept.append(track)
+    return kept
 
 
 @dataclass
@@ -231,7 +277,7 @@ class SequenceTracker:
             )
 
         surviving.sort(key=lambda track: track.confidence, reverse=True)
-        self.tracks = surviving[:MAXIMUM_ANNOTATIONS]
+        self.tracks = _suppress_duplicates(surviving)[:MAXIMUM_ANNOTATIONS]
 
         return [
             DroneFlybyPredictionDto(
