@@ -148,14 +148,18 @@ SPAWN_SAFETY_MARGIN = 50.0
 #
 # Observed population peaks of 27-37 agents (vs. 5 starting) coincided with score
 # plateauing/oscillating in a boom-bust pattern: growth itself drives per-capita
-# food scarcity (see CURRICULUM_FRUIT_MULT_END/CURRICULUM_TREE_MULT_END in
-# train.py, raised to work alongside this), which then triggers a die-off, which
-# lets food recover, repeat. This makes the *decision* to reproduce
-# population-aware, the same way it's already energy-safety-aware, rather than
-# leaving population size to grow unchecked against a food supply that can't
-# support it indefinitely. Thresholds picked from that same observed range, not a
-# rigorously derived carrying capacity - needs the same real-gameplay
-# verification as everything else here before fully trusting the exact numbers.
+# food scarcity against the real simulator's own (unscaled) fruit/tree supply,
+# which then triggers a die-off, which lets food recover, repeat. This makes the
+# *decision* to reproduce population-aware, the same way it's already
+# energy-safety-aware, rather than leaving population size to grow unchecked
+# against a food supply that can't support it indefinitely - deliberately doesn't
+# touch the food supply itself (train.py's curriculum still anneals back to the
+# real 1.0 density, not higher) since evaluation/deployment always sees that real,
+# unscaled density and the policy needs to be calibrated against it, not an
+# artificially generous training-only substitute. Thresholds picked from that same
+# observed population range, not a rigorously derived carrying capacity - needs
+# the same real-gameplay verification as everything else here before fully
+# trusting the exact numbers.
 POPULATION_TAPER_START = 15
 POPULATION_TAPER_END = 35
 

@@ -63,24 +63,20 @@ MAX_GRAD_NORM = 0.5
 
 # Curriculum: start with extra fruit/tree density so food is easy to find while the
 # fruit-approach reward shaping is still bootstrapping "moving toward food is good"
-# behavior, then anneal toward a steady-state density.
+# behavior, then anneal down to the environment's normal (unscaled) difficulty.
+# Deliberately anneals all the way back to 1.0, not higher: evaluation/deployment
+# (local_playground.py, visualize_trained_policy.py, and presumably whatever the
+# competition itself runs) uses the real simulator's own unscaled fruit/tree
+# density, never SurvivalEnv.set_difficulty() - training at a permanently higher
+# multiplier would make the policy comfortable with more food than it will
+# actually have at evaluation, working against POPULATION_TAPER_START/END below
+# rather than with it. See that constant's own comment for the actual fix for
+# population booms outstripping the food supply - it doesn't need this to change.
 # SPAWN_REWARD lets the colony grow well beyond what the *declining* food supply can
 # support
 CURRICULUM_UPDATES = 400
 CURRICULUM_FRUIT_MULT_START = 1.5
 CURRICULUM_TREE_MULT_START = 1.3
-
-# Steady-state floor once the curriculum finishes annealing - raised above the
-# environment's own baseline (1.0) rather than annealing all the way down to it.
-# Observed population peaks of 27-37 agents (vs. 5 starting) coincided with score
-# plateauing/oscillating in a boom-bust pattern: growth itself drives per-capita
-# food scarcity, which then triggers a die-off, which lets food recover, repeat.
-# A permanently larger food supply raises how big a population the environment can
-# actually sustain, working alongside POPULATION_TAPER_START/END in gym_env.py
-# (which discourages *over*-breeding into that larger ceiling) rather than just
-# leaving population size to grow unchecked against a fixed-size food supply.
-CURRICULUM_FRUIT_MULT_END = 1.25
-CURRICULUM_TREE_MULT_END = 1.25
 
 # Predators start at reduced speed (still present, still learnable-around) and ramp
 # to full speed over the same curriculum window - a predator agents can usually
@@ -392,14 +388,8 @@ def train():
             # Anneal curriculum difficulty and exploration entropy. Only affects envs
             # that reset from here on - an in-progress episode keeps its own settings.
             curriculum_progress = min(1.0, update / CURRICULUM_UPDATES)
-            fruit_mult = (
-                CURRICULUM_FRUIT_MULT_START
-                + (CURRICULUM_FRUIT_MULT_END - CURRICULUM_FRUIT_MULT_START) * curriculum_progress
-            )
-            tree_mult = (
-                CURRICULUM_TREE_MULT_START
-                + (CURRICULUM_TREE_MULT_END - CURRICULUM_TREE_MULT_START) * curriculum_progress
-            )
+            fruit_mult = CURRICULUM_FRUIT_MULT_START + (1.0 - CURRICULUM_FRUIT_MULT_START) * curriculum_progress
+            tree_mult = CURRICULUM_TREE_MULT_START + (1.0 - CURRICULUM_TREE_MULT_START) * curriculum_progress
             predator_speed_mult = (
                 CURRICULUM_PREDATOR_SPEED_MULT_START
                 + (1.0 - CURRICULUM_PREDATOR_SPEED_MULT_START) * curriculum_progress
