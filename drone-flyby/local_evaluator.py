@@ -421,11 +421,21 @@ def replay(
 def score(
     scene: str,
     predictions: Dict[int, List[dict]],
+    frames: Optional[Sequence[int]] = None,
 ) -> Tuple[float, Dict[str, float]]:
-    """Calculate COCO mAP at IoU 0.50, the way the evaluation service does."""
+    """Calculate COCO mAP at IoU 0.50, the way the evaluation service does.
+
+    ``frames`` restricts scoring to a subset (ground truth and predictions
+    alike). Pass the frames your detector never trained on to get an honest
+    number: replay still runs the whole scene so a stateful camera/tracking
+    policy warms up the way it would in a real attempt, but only the held-out
+    frames count towards the score. Omit it to score every frame in the scene,
+    which is what the competition does (there is no train/val split to honour
+    on the actual evaluation sequence).
+    """
     from faster_coco_eval import COCO, COCOeval_faster
 
-    frames = frame_numbers(scene)
+    frames = list(frames) if frames is not None else frame_numbers(scene)
     ground_truth = {frame: load_annotations(frame, scene) for frame in frames}
 
     present_classes = {
@@ -539,6 +549,21 @@ def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def parse_frame_range(spec: str) -> List[int]:
+    """Parse '20-24' or '20,21,23' (or a mix) into a sorted list of frames."""
+    frames = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            start, end = part.split('-', 1)
+            frames.update(range(int(start), int(end) + 1))
+        else:
+            frames.add(int(part))
+    return sorted(frames)
+
+
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
@@ -565,13 +590,34 @@ def main() -> int:
         'Should print 1.000 and proves the scorer agrees with the data.',
     )
     parser.add_argument('--verbose', action='store_true', help='Log every frame.')
+    parser.add_argument(
+        '--holdout-frames',
+        default=None,
+        help="Score only these frames, e.g. '20-24'. Replay still sends every "
+        "frame in the scene (so a stateful policy warms up as it would in a "
+        "real attempt); scoring is restricted to frames the detector did not "
+        "train on. Use this instead of the full-scene score to avoid "
+        "reporting a number contaminated by training frames.",
+    )
     arguments = parser.parse_args()
 
     try:
-        frame_numbers(arguments.scene)
+        scene_frames = frame_numbers(arguments.scene)
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
         return 1
+
+    holdout_frames = None
+    if arguments.holdout_frames:
+        holdout_frames = parse_frame_range(arguments.holdout_frames)
+        unknown = set(holdout_frames) - set(scene_frames)
+        if unknown:
+            print(
+                f'--holdout-frames names frames not in {arguments.scene!r}: '
+                f'{sorted(unknown)}',
+                file=sys.stderr,
+            )
+            return 1
 
     if arguments.oracle:
         print(f'Scoring the ground truth for {arguments.scene} ...')
@@ -595,7 +641,13 @@ def main() -> int:
             arguments.verbose,
         )
 
-    coco_map_50, ap_by_class = score(arguments.scene, predictions)
+    if holdout_frames is not None:
+        predictions = {
+            frame: detections
+            for frame, detections in predictions.items()
+            if frame in holdout_frames
+        }
+    coco_map_50, ap_by_class = score(arguments.scene, predictions, holdout_frames)
 
     print()
     if statistics is not None:
@@ -606,7 +658,12 @@ def main() -> int:
     for name, value in sorted(ap_by_class.items(), key=lambda item: -item[1]):
         print(f'  {name:16s} {value:.3f}')
     print()
-    print(f'COCO mAP@0.50: {coco_map_50:.3f}')
+    if holdout_frames is not None:
+        print(f'COCO mAP@0.50 (held-out frames {arguments.holdout_frames}): {coco_map_50:.3f}')
+    else:
+        print(f'COCO mAP@0.50 (all {len(scene_frames)} frames, NOT held-out — '
+              f'includes training frames if this detector was trained on this '
+              f'scene): {coco_map_50:.3f}')
     if statistics is not None and not arguments.realtime:
         print(
             'This is the offline number. Run with --realtime to see what the '
