@@ -1,0 +1,49 @@
+#!/bin/bash
+# Build a venv with torch (CUDA) + this repo's requirements, and verify it.
+#
+# Submit from ~/projects/NordicAICup2026/drone-work (or edit WORK_DIR below):
+#   sbatch setup_env.job
+#
+# Output streams unbuffered to slurm-<jobid>.out -- watch it live with:
+#   tail -f slurm-<jobid>.out
+#
+# Creates a fresh venv per job (venv_<jobid>) so this never collides with an
+# install already running in another job step against a shared venv/ path.
+
+#SBATCH --job-name=DroneFlyby_SetupEnv
+#SBATCH --output=slurm-%j.out
+#SBATCH --cpus-per-task=4
+#SBATCH --time=02:00:00
+#SBATCH --mem=16G
+#SBATCH --partition=scavenge
+#SBATCH --gres=gpu:h100:1
+
+set -e
+export PYTHONUNBUFFERED=1
+
+WORK_DIR="$HOME/projects/NordicAICup2026/drone-work"
+REPO_DIR="$WORK_DIR/repo/drone-flyby"
+VENV_DIR="$WORK_DIR/venv_${SLURM_JOB_ID}"
+
+echo "Running on: $(hostname)"
+echo "Work dir:   $WORK_DIR"
+echo "Venv dir:   $VENV_DIR"
+nvidia-smi
+
+module load Python/3.12.3-GCCcore-13.3.0
+
+python3 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
+
+# No --quiet: this job exists so the install output is visible in the log.
+python -u -m pip install --upgrade pip
+python -u -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+python -u -m pip install -r "$REPO_DIR/requirements.txt"
+
+echo "=== Verifying installation ==="
+python -u -c "import torch; print('torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"
+python -u -c "import ultralytics; print('ultralytics', ultralytics.__version__)"
+python -u -c "import faster_coco_eval; print('faster_coco_eval OK')"
+
+echo "Environment ready: $VENV_DIR"
+echo "Activate with: source $VENV_DIR/bin/activate"

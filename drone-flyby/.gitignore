@@ -5,6 +5,9 @@ runs/
 *.pt
 drone-captures/
 validation_recon_images/
+venv/
+venv_*/
+slurm-*.out
 
 # Generic Python files (Source: https://github.com/github/gitignore/blob/main/Python.gitignore)
 __pycache__/
