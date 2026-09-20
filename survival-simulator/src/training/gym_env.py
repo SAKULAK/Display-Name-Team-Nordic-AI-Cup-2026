@@ -106,11 +106,17 @@ SEARCH_EMA_ALPHA = 0.02
 # remaining stretch of penalized ticks would cost more than DEATH_PENALTY's flat
 # -2.0, dying sooner becomes cheaper than continuing to search, which is exactly
 # backwards. Capping the streak bounds any one stuck-spell's total cost well below
-# DEATH_PENALTY (30 * 0.05 = 1.5 < 2.0) so enduring is always cheaper than dying,
-# while still giving a sharp, real deterrent against the actually-observed pattern
-# (brief repeated stalls), not permanent paralysis.
-STILLNESS_PENALTY_COEF = 0.05
-STILLNESS_STREAK_CAP = 30
+# DEATH_PENALTY (180 * 0.01 = 1.8 < 2.0) so enduring is always cheaper than dying,
+# while still giving a real deterrent against the actually-observed pattern.
+#
+# Recalibrated from an initial (0.05, 30) after measuring real gameplay: observed
+# stillness streaks commonly ran 450-700+ ticks, so a 30-tick window only covered
+# the first ~5% of a typical stall before going fully unpunished for the rest.
+# Lower coefficient, longer cap covers far more of an actual streak's length for
+# the same worst-case-total safety margin, trading peak per-tick sharpness for
+# coverage of what streaks actually look like in practice.
+STILLNESS_PENALTY_COEF = 0.01
+STILLNESS_STREAK_CAP = 180
 
 # Mirror of FRUIT_APPROACH_COEF, sign flipped: reward increasing distance to the
 # nearest known predator, penalize closing it. More directly attributable
