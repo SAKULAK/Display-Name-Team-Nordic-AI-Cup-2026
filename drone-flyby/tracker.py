@@ -200,6 +200,19 @@ class SequenceTracker:
             track.last_frame = frame
             track.missed_frames += elapsed
             track.confidence *= CONFIDENCE_DECAY_PER_FRAME ** elapsed
+            # Pull the velocity estimate towards the current scene motion
+            # each missed frame, rather than propagating forever on whatever
+            # was observed at the last real match. Real motion in this scene
+            # drifts (~1px/frame^2, see module docstring); a frozen velocity
+            # falls further behind the longer a track goes unconfirmed, and
+            # this is measured to matter: l1_cycle's biggest holdout losses
+            # were exactly on multi-frame-propagated tracks.
+            track.velocity = (
+                SCENE_VELOCITY_SMOOTHING * self.scene_velocity[0]
+                + (1 - SCENE_VELOCITY_SMOOTHING) * track.velocity[0],
+                SCENE_VELOCITY_SMOOTHING * self.scene_velocity[1]
+                + (1 - SCENE_VELOCITY_SMOOTHING) * track.velocity[1],
+            )
             if track.confidence < MINIMUM_CONFIDENCE or track.missed_frames > MAXIMUM_MISSED_FRAMES:
                 continue
             surviving.append(track)

@@ -11,10 +11,12 @@ rather than just the host.
 import datetime
 import logging
 import time
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 
+from detector import get_detector
 from dtos import DroneFlybyPredictRequestDto, DroneFlybyPredictResponseDto
 from example import predict
 from utils import validate_response
@@ -25,7 +27,22 @@ PORT = 9053
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # get_detector() loads the model and runs a dummy inference (see
+    # detector.py). Forcing that here, before uvicorn accepts connections,
+    # is what actually pays the cold-start cost before an attempt instead of
+    # on frame 0 -- calling it lazily from inside predict() does not help,
+    # since nothing calls it until the first real request arrives anyway.
+    logger.info('Warming up detector...')
+    started = time.perf_counter()
+    get_detector()
+    logger.info('Detector warmed up in %.2fs', time.perf_counter() - started)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 start_time = time.time()
 
 

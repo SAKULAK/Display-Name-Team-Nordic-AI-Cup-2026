@@ -5,6 +5,7 @@ import json
 import math
 import shutil
 from pathlib import Path
+from typing import Optional, Set
 
 from dtos import IMAGE_HEIGHT, IMAGE_WIDTH, OBJECT_CLASSES
 
@@ -12,7 +13,28 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = ROOT / 'datasets' / 'helsinki'
 
 
-def convert(source=ROOT / 'src' / 'helsinki', output=DEFAULT_OUTPUT, val_fraction=0.2):
+def frame_number(stem: str) -> int:
+    return int(stem.split('_')[-1])
+
+
+def convert(
+    source=ROOT / 'src' / 'helsinki',
+    output=DEFAULT_OUTPUT,
+    val_fraction=0.2,
+    train_frames: Optional[Set[int]] = None,
+):
+    """Convert annotated frames to a YOLO dataset.
+
+    By default splits temporally: the last ``val_fraction`` of frames (by
+    frame number) become val, the rest train. Pass ``train_frames`` (frame
+    numbers) to pick an explicit, non-contiguous training set instead --
+    useful when a short contiguous prefix would exclude classes that only
+    appear later (each class in Helsinki has exactly one instance, visible
+    across a contiguous span of frames starting wherever it first enters
+    view, so a small prefix can miss a class entirely; see
+    ``--train-frames``). ``val_fraction`` is ignored when ``train_frames``
+    is given -- the split is exactly those frames versus the rest.
+    """
     source, output = Path(source).resolve(), Path(output).resolve()
     if not 0 < val_fraction < 1:
         raise ValueError('val_fraction must be between zero and one')
@@ -42,10 +64,28 @@ def convert(source=ROOT / 'src' / 'helsinki', output=DEFAULT_OUTPUT, val_fractio
                    (x2 - x1) / IMAGE_WIDTH, (y2 - y1) / IMAGE_HEIGHT)
             lines.append(f'{class_id} ' + ' '.join(f'{v:.10f}' for v in box))
         records.append((image, '\n'.join(lines) + ('\n' if lines else '')))
-    val_count = max(1, min(len(images) - 1, round(len(images) * val_fraction)))
-    split_at = len(images) - val_count
-    for i, (image, labels) in enumerate(records):
-        split = 'train' if i < split_at else 'val'
+
+    if train_frames is not None:
+        unknown = train_frames - {frame_number(image.stem) for image, _ in records}
+        if unknown:
+            raise ValueError(f'--train-frames names frames not present: {sorted(unknown)}')
+        if len(train_frames) >= len(records):
+            raise ValueError('train_frames must leave at least one frame for val')
+
+        def split_of(image):
+            return 'train' if frame_number(image.stem) in train_frames else 'val'
+    else:
+        val_count = max(1, min(len(images) - 1, round(len(images) * val_fraction)))
+        split_at = len(images) - val_count
+
+        def split_of(image):
+            return 'train' if images.index(image) < split_at else 'val'
+
+    train_count = val_count = 0
+    for image, labels in records:
+        split = split_of(image)
+        train_count += split == 'train'
+        val_count += split == 'val'
         image_dir, label_dir = output / 'images' / split, output / 'labels' / split
         image_dir.mkdir(parents=True, exist_ok=True)
         label_dir.mkdir(parents=True, exist_ok=True)
@@ -55,7 +95,7 @@ def convert(source=ROOT / 'src' / 'helsinki', output=DEFAULT_OUTPUT, val_fractio
     yaml = f'path: {json.dumps(output.as_posix())}\ntrain: images/train\nval: images/val\nnames:\n'
     yaml += ''.join(f'  {i}: {json.dumps(name)}\n' for i, name in enumerate(OBJECT_CLASSES))
     (output / 'data.yaml').write_text(yaml, encoding='utf-8')
-    print(f'Converted {split_at} train / {val_count} val images: {output / "data.yaml"}')
+    print(f'Converted {train_count} train / {val_count} val images: {output / "data.yaml"}')
     return output / 'data.yaml'
 
 
@@ -64,5 +104,12 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=Path, default=ROOT / 'src' / 'helsinki')
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument('--val-fraction', type=float, default=0.2)
+    parser.add_argument(
+        '--train-frames', type=int, nargs='+', default=None,
+        help='Explicit frame numbers for training (rest become val); overrides --val-fraction',
+    )
     args = parser.parse_args()
-    convert(args.source, args.output, args.val_fraction)
+    convert(
+        args.source, args.output, args.val_fraction,
+        train_frames=set(args.train_frames) if args.train_frames is not None else None,
+    )

@@ -48,7 +48,12 @@ def write_sample(image, objects, region, output, split, name, scout=False):
 
 
 def generate(source, output, l1_crops_per_object=1, l2_crops_per_object=2,
-             background_crops=2, seed=42, val_fraction=0.2, scout=False):
+             background_crops=2, seed=42, val_fraction=0.2, scout=False, train_frames=None):
+    """``train_frames`` (frame numbers), when given, picks an explicit
+    training set instead of a temporal prefix -- see prepare_yolo.convert's
+    docstring for why a short prefix can miss classes entirely. All crops
+    derived from one source frame still share that frame's split.
+    """
     source, output = Path(source), Path(output).resolve()
     if output.exists():
         raise FileExistsError(f'Choose a new output directory: {output}')
@@ -66,10 +71,20 @@ def generate(source, output, l1_crops_per_object=1, l2_crops_per_object=2,
     for split in ('train', 'val'):
         for kind in ('images', 'labels'):
             (output/kind/split).mkdir(parents=True)
-    split_at = len(frames)-max(1, min(len(frames)-1, round(len(frames)*val_fraction)))
+    if train_frames is not None:
+        present = {int(frame.stem.split('_')[-1]) for frame in frames}
+        unknown = set(train_frames) - present
+        if unknown:
+            raise ValueError(f'--train-frames names frames not present: {sorted(unknown)}')
+        if len(train_frames) >= len(frames):
+            raise ValueError('train_frames must leave at least one frame for val')
+        train_frame_numbers = set(train_frames)
+    else:
+        split_at = len(frames)-max(1, min(len(frames)-1, round(len(frames)*val_fraction)))
+        train_frame_numbers = {int(f.stem.split('_')[-1]) for f in frames[:split_at]}
     rng, counts, manifest = random.Random(seed), Counter(), []
     for index, frame in enumerate(frames):
-        split = 'train' if index < split_at else 'val'
+        split = 'train' if int(frame.stem.split('_')[-1]) in train_frame_numbers else 'val'
         image = cv2.imread(str(frame))
         if image is None or image.shape[:2] != (2160, 3840):
             raise ValueError(f'Expected 3840x2160 source: {frame}')
@@ -128,6 +143,12 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--val-fraction', type=float, default=0.2)
     parser.add_argument('--scout', action='store_true', help='L0 only, one target class; no inference integration')
+    parser.add_argument(
+        '--train-frames', type=int, nargs='+', default=None,
+        help='Explicit frame numbers for training (rest become val); overrides --val-fraction',
+    )
     args = vars(parser.parse_args())
     args['output'] = args['output'] or ROOT/'datasets'/('helsinki_scout' if args['scout'] else 'helsinki_multires')
+    if args['train_frames'] is not None:
+        args['train_frames'] = set(args['train_frames'])
     generate(**args)
